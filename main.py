@@ -1,58 +1,53 @@
-"""Real-time gaze-controlled cursor with blink click support (MediaPipe Tasks API)."""
+#!/usr/bin/env python3
+"""Real-time gaze-controlled cursor with calibration and advanced interactions."""
 from __future__ import annotations
 
 import argparse
-import collections
+import platform
+import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Deque, Iterable, Optional, Tuple
+from typing import Optional
 
-import cv2
-import mediapipe as mp
-import numpy as np
-import pyautogui
+from gaze.calibration import CalibrationModel, apply_head_pose_compensation, default_calibration_targets
+from gaze.controller import CursorSmoother, map_to_screen
+from gaze.interactions import AdaptiveBlinkDetector, DragState, DwellClickDetector
+from gaze.tracker import extract_observation
 
 
-Point = Tuple[float, float]
-
-LEFT_EYE = {"left": 33, "right": 133, "top": 159, "bottom": 145}
-RIGHT_EYE = {"left": 362, "right": 263, "top": 386, "bottom": 374}
-LEFT_IRIS = [468, 469, 470, 471, 472]
-RIGHT_IRIS = [473, 474, 475, 476, 477]
 DEFAULT_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/latest/face_landmarker.task"
 )
 
 
-BaseOptions = mp.tasks.BaseOptions
-FaceLandmarker = mp.tasks.vision.FaceLandmarker
-FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-RunningMode = mp.tasks.vision.RunningMode
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Eye-controlled cursor using latest MediaPipe Face Landmarker.")
     parser.add_argument("--camera", type=int, default=0, help="Camera index.")
     parser.add_argument("--flip", action="store_true", help="Mirror the frame horizontally.")
-    parser.add_argument("--history", type=int, default=6, help="Smoothing history for cursor points.")
     parser.add_argument("--margin", type=float, default=0.15, help="Dead margin from each edge (0-0.4).")
-    parser.add_argument("--blink-threshold", type=float, default=0.20, help="EAR threshold to detect blink.")
-    parser.add_argument("--blink-frames", type=int, default=2, help="Consecutive low-EAR frames for click.")
-    parser.add_argument("--click-cooldown", type=float, default=0.6, help="Seconds between clicks.")
     parser.add_argument("--show-debug", action="store_true", help="Show landmarks and tracking overlays.")
     parser.add_argument("--dry-run", action="store_true", help="Do not move/click cursor, only visualize.")
-    parser.add_argument(
-        "--model-path",
-        default="models/face_landmarker.task",
-        help="Path to MediaPipe Face Landmarker model file (.task).",
-    )
-    parser.add_argument(
-        "--model-url",
-        default=DEFAULT_MODEL_URL,
-        help="URL used to auto-download the model when --model-path is missing.",
-    )
+
+    parser.add_argument("--smoothing-alpha", type=float, default=0.35, help="EMA smoothing alpha for cursor.")
+    parser.add_argument("--velocity-damping", type=float, default=0.70, help="Velocity damping for smooth cursor.")
+    parser.add_argument("--max-step", type=float, default=120.0, help="Max cursor step per frame.")
+
+    parser.add_argument("--blink-frames", type=int, default=2, help="Consecutive low-EAR frames for click.")
+    parser.add_argument("--click-cooldown", type=float, default=0.6, help="Seconds between clicks.")
+    parser.add_argument("--blink-threshold-ratio", type=float, default=0.70, help="Adaptive EAR threshold ratio.")
+    parser.add_argument("--baseline-alpha", type=float, default=0.02, help="Adaptive baseline update rate.")
+
+    parser.add_argument("--dwell-seconds", type=float, default=1.0, help="Seconds for dwell click trigger.")
+    parser.add_argument("--dwell-radius", type=float, default=45.0, help="Movement radius for dwell trigger.")
+
+    parser.add_argument("--calibration-points", type=int, default=9, choices=[5, 9], help="Calibration grid size.")
+    parser.add_argument("--pose-comp-gain", type=float, default=0.08, help="Head-pose compensation gain.")
+
+    parser.add_argument("--model-path", default="models/face_landmarker.task", help="Path to face_landmarker.task.")
+    parser.add_argument("--model-url", default=DEFAULT_MODEL_URL, help="Model URL for first-run download.")
     return parser.parse_args()
 
 
@@ -64,66 +59,62 @@ def ensure_model(model_path: Path, model_url: str) -> Path:
     return model_path
 
 
-def landmark_to_pixel(landmark, width: int, height: int) -> Point:
-    return landmark.x * width, landmark.y * height
+def import_runtime_dependencies():
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError(
+            "OpenCV failed to import. If you see libGL errors, install system package 'libgl1' (Debian/Ubuntu) "
+            "or run in a desktop environment with OpenCV GUI dependencies."
+        ) from exc
+
+    try:
+        import mediapipe as mp
+    except Exception as exc:
+        raise RuntimeError("MediaPipe import failed. Run: pip install -r requirements.txt") from exc
+
+    try:
+        import pyautogui
+    except Exception as exc:
+        raise RuntimeError("pyautogui import failed. Run: pip install -r requirements.txt") from exc
+
+    return cv2, mp, pyautogui
 
 
-def eye_aspect_ratio(landmarks, eye_idx: dict[str, int], width: int, height: int) -> float:
-    left = np.array(landmark_to_pixel(landmarks[eye_idx["left"]], width, height))
-    right = np.array(landmark_to_pixel(landmarks[eye_idx["right"]], width, height))
-    top = np.array(landmark_to_pixel(landmarks[eye_idx["top"]], width, height))
-    bottom = np.array(landmark_to_pixel(landmarks[eye_idx["bottom"]], width, height))
-    vertical = np.linalg.norm(top - bottom)
-    horizontal = np.linalg.norm(left - right)
-    if horizontal == 0:
-        return 0.0
-    return float(vertical / horizontal)
+def draw_status(cv2, frame, text: str, line: int) -> None:
+    cv2.putText(frame, text, (10, 24 + line * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
 
-def iris_center(landmarks, iris_idx: Iterable[int], width: int, height: int) -> Point:
-    points = np.array([landmark_to_pixel(landmarks[i], width, height) for i in iris_idx], dtype=np.float32)
-    center = points.mean(axis=0)
-    return float(center[0]), float(center[1])
-
-
-def smooth_point(points: Deque[Point]) -> Optional[Point]:
-    if not points:
-        return None
-    arr = np.array(points, dtype=np.float32)
-    mean = arr.mean(axis=0)
-    return float(mean[0]), float(mean[1])
-
-
-def clamp01(value: float) -> float:
-    return max(0.0, min(1.0, value))
-
-
-def map_to_screen(norm_x: float, norm_y: float, screen_w: int, screen_h: int, margin: float) -> Point:
-    margin = max(0.0, min(0.4, margin))
-    usable = 1.0 - 2.0 * margin
-    if usable <= 0:
-        usable = 0.2
-    x = clamp01((norm_x - margin) / usable)
-    y = clamp01((norm_y - margin) / usable)
-    return x * screen_w, y * screen_h
-
-
-def draw_status(frame, text: str, line: int) -> None:
-    cv2.putText(
-        frame,
-        text,
-        (10, 24 + line * 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
+def launch_on_screen_keyboard() -> str:
+    system = platform.system().lower()
+    try:
+        if "windows" in system:
+            subprocess.Popen(["osk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return "On-screen keyboard launched"
+        if "linux" in system:
+            for cmd in (["onboard"], ["florence"], ["matchbox-keyboard"]):
+                try:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return f"Launched {' '.join(cmd)}"
+                except FileNotFoundError:
+                    continue
+            return "No on-screen keyboard app found (tried onboard/florence/matchbox-keyboard)"
+        if "darwin" in system:
+            return "Enable macOS Accessibility Keyboard manually (System Settings > Accessibility > Keyboard)."
+    except Exception:
+        return "Failed to launch on-screen keyboard"
+    return "Unsupported platform for automatic on-screen keyboard launch"
 
 
 def main() -> None:
     args = parse_args()
     model_path = ensure_model(Path(args.model_path), args.model_url)
+    cv2, mp, pyautogui = import_runtime_dependencies()
+
+    BaseOptions = mp.tasks.BaseOptions
+    FaceLandmarker = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+    RunningMode = mp.tasks.vision.RunningMode
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -132,9 +123,24 @@ def main() -> None:
     pyautogui.FAILSAFE = False
     screen_w, screen_h = pyautogui.size()
 
-    history: Deque[Point] = collections.deque(maxlen=max(1, args.history))
-    blink_frames = 0
-    last_click = 0.0
+    calibration = CalibrationModel()
+    calibration_targets = default_calibration_targets(args.calibration_points)
+    calibrating = False
+    calibration_index = 0
+
+    cursor = CursorSmoother(alpha=args.smoothing_alpha, velocity_damping=args.velocity_damping, max_step=args.max_step)
+    blink = AdaptiveBlinkDetector(
+        baseline_alpha=args.baseline_alpha,
+        threshold_ratio=args.blink_threshold_ratio,
+        blink_frames=args.blink_frames,
+        cooldown_s=args.click_cooldown,
+    )
+    dwell = DwellClickDetector(radius_px=args.dwell_radius, dwell_s=args.dwell_seconds, cooldown_s=args.click_cooldown)
+    drag = DragState(False)
+
+    click_mode = "left"
+    dwell_enabled = False
+    osk_message = ""
 
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -143,99 +149,137 @@ def main() -> None:
         min_face_detection_confidence=0.5,
         min_face_presence_confidence=0.5,
         min_tracking_confidence=0.5,
+        output_facial_transformation_matrixes=True,
         output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False,
     )
 
     fps_timer = time.time()
     frame_counter = 0
     fps = 0.0
 
-    with FaceLandmarker.create_from_options(options) as face_landmarker:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    try:
+        with FaceLandmarker.create_from_options(options) as face_landmarker:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if args.flip:
+                    frame = cv2.flip(frame, 1)
 
-            if args.flip:
-                frame = cv2.flip(frame, 1)
+                height, width = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
-            height, width = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(time.time() * 1000)
-            result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+                status = 0
+                if result.face_landmarks:
+                    transform_matrix: Optional[list[list[float]]] = None
+                    if result.facial_transformation_matrixes:
+                        transform_matrix = result.facial_transformation_matrixes[0]
 
-            status_line = 0
-            if result.face_landmarks:
-                landmarks = result.face_landmarks[0]
+                    obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
+                    gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
 
-                left_iris = iris_center(landmarks, LEFT_IRIS, width, height)
-                right_iris = iris_center(landmarks, RIGHT_IRIS, width, height)
-                gaze = ((left_iris[0] + right_iris[0]) / 2.0, (left_iris[1] + right_iris[1]) / 2.0)
+                    if calibrating:
+                        tx, ty = calibration_targets[calibration_index]
+                        cv2.circle(frame, (int(tx * width), int(ty * height)), 12, (0, 255, 255), -1)
+                        draw_status(cv2, frame, "Calibration active: look at dot then press SPACE", status)
+                        status += 1
+                    else:
+                        mapped_norm = calibration.map(gaze_norm)
+                        target_cursor = map_to_screen(mapped_norm[0], mapped_norm[1], screen_w, screen_h, args.margin)
+                        smooth_cursor = cursor.update(target_cursor)
+                        if not args.dry_run:
+                            pyautogui.moveTo(smooth_cursor[0], smooth_cursor[1], _pause=False)
 
-                history.append(gaze)
-                smoothed = smooth_point(history)
+                        if blink.update(obs.ear, time.time()):
+                            if not args.dry_run:
+                                if click_mode == "left":
+                                    pyautogui.click(button="left")
+                                else:
+                                    pyautogui.click(button="right")
+                            draw_status(cv2, frame, f"Blink {click_mode} click", status)
+                            status += 1
 
-                if smoothed is not None:
-                    norm_x = smoothed[0] / width
-                    norm_y = smoothed[1] / height
-                    cursor_x, cursor_y = map_to_screen(norm_x, norm_y, screen_w, screen_h, args.margin)
+                        if dwell_enabled and dwell.update(smooth_cursor, time.time()):
+                            if not args.dry_run:
+                                pyautogui.click(button=click_mode)
+                            draw_status(cv2, frame, f"Dwell {click_mode} click", status)
+                            status += 1
 
-                    if not args.dry_run:
-                        pyautogui.moveTo(cursor_x, cursor_y, _pause=False)
+                        draw_status(cv2, frame, f"Cursor: ({int(smooth_cursor[0])}, {int(smooth_cursor[1])})", status)
+                        status += 1
 
-                    draw_status(frame, f"Cursor: ({int(cursor_x)}, {int(cursor_y)})", status_line)
-                    status_line += 1
+                    draw_status(cv2, frame, f"EAR: {obs.ear:.3f} baseline: {blink.baseline_ear:.3f}", status)
+                    status += 1
 
-                left_ear = eye_aspect_ratio(landmarks, LEFT_EYE, width, height)
-                right_ear = eye_aspect_ratio(landmarks, RIGHT_EYE, width, height)
-                ear = (left_ear + right_ear) / 2.0
-
-                if ear < args.blink_threshold:
-                    blink_frames += 1
+                    if args.show_debug:
+                        cv2.circle(frame, (int(obs.left_iris_px[0]), int(obs.left_iris_px[1])), 4, (255, 0, 0), -1)
+                        cv2.circle(frame, (int(obs.right_iris_px[0]), int(obs.right_iris_px[1])), 4, (0, 0, 255), -1)
                 else:
-                    blink_frames = 0
+                    cursor.reset()
+                    draw_status(cv2, frame, "Face not detected", status)
+                    status += 1
 
-                now = time.time()
-                if blink_frames >= args.blink_frames and now - last_click >= args.click_cooldown:
-                    if not args.dry_run:
-                        pyautogui.click()
-                    last_click = now
-                    blink_frames = 0
-                    draw_status(frame, "Click triggered", status_line)
-                    status_line += 1
+                frame_counter += 1
+                if frame_counter >= 10:
+                    now = time.time()
+                    fps = frame_counter / max(now - fps_timer, 1e-6)
+                    fps_timer = now
+                    frame_counter = 0
 
-                draw_status(frame, f"EAR: {ear:.3f}", status_line)
-                status_line += 1
+                draw_status(cv2, frame, f"FPS: {fps:.1f}", status)
+                status += 1
+                draw_status(cv2, frame, f"Mode: {click_mode} | Dwell: {dwell_enabled} | Drag: {drag.enabled}", status)
+                status += 1
+                if osk_message:
+                    draw_status(cv2, frame, osk_message, status)
+                    status += 1
+                draw_status(cv2, frame, "q quit | c calib | m click-mode | v dwell | g drag | k keyboard", status)
 
-                if args.show_debug:
-                    cv2.circle(frame, (int(left_iris[0]), int(left_iris[1])), 4, (255, 0, 0), -1)
-                    cv2.circle(frame, (int(right_iris[0]), int(right_iris[1])), 4, (0, 0, 255), -1)
-                    cv2.circle(frame, (int(gaze[0]), int(gaze[1])), 5, (0, 255, 255), -1)
-            else:
-                blink_frames = 0
-                draw_status(frame, "Face not detected", status_line)
-                status_line += 1
-
-            frame_counter += 1
-            if frame_counter >= 10:
-                now = time.time()
-                fps = frame_counter / max(now - fps_timer, 1e-6)
-                fps_timer = now
-                frame_counter = 0
-
-            draw_status(frame, f"FPS: {fps:.1f}", status_line)
-            status_line += 1
-            draw_status(frame, "Press q to quit", status_line)
-
-            cv2.imshow("Gaze Cursor Control", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
+                cv2.imshow("Gaze Cursor Control", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("m"):
+                    click_mode = "right" if click_mode == "left" else "left"
+                if key == ord("v"):
+                    dwell_enabled = not dwell_enabled
+                if key == ord("g"):
+                    if drag.toggle() and not args.dry_run:
+                        pyautogui.mouseDown(button="left")
+                    elif not drag.enabled and not args.dry_run:
+                        pyautogui.mouseUp(button="left")
+                if key == ord("k"):
+                    osk_message = launch_on_screen_keyboard()
+                if key == ord("c"):
+                    calibration.clear()
+                    calibrating = True
+                    calibration_index = 0
+                if calibrating and key == ord(" "):
+                    if result.face_landmarks:
+                        transform_matrix = result.facial_transformation_matrixes[0] if result.facial_transformation_matrixes else None
+                        obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
+                        gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
+                        calibration.add_sample(gaze_norm, calibration_targets[calibration_index])
+                        calibration_index += 1
+                        if calibration_index >= len(calibration_targets):
+                            calibration.fit()
+                            calibrating = False
+                            osk_message = "Calibration fitted successfully"
+    finally:
+        if drag.enabled and not args.dry_run:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                pass
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,13 +1,21 @@
 # Eye-Tracker (Gaze + Cursor Control)
 
-A real-time IPCV project that uses your eye movement to move the mouse cursor and supports blink-to-click.
+A real-time IPCV project for gaze-based mouse control with calibration, head-pose compensation, adaptive blink clicks, dwell clicks, and drag toggle.
 
-## Features
-- Real-time face/eye landmark tracking with MediaPipe Face Mesh.
-- Cursor control using both iris centers (smoothed for stability).
-- Blink detection using Eye Aspect Ratio (EAR) for mouse click actions.
-- Dry-run mode for safe testing without moving your real cursor.
-- Debug overlays for iris points, gaze point, EAR, and FPS.
+## Major upgrades implemented
+- **Calibration system (5-point or 9-point):** quadratic regression from gaze features to screen coordinates.
+- **Head-pose compensation:** uses MediaPipe facial transform matrix to reduce drift.
+- **Adaptive blink detection:** per-user EAR baseline + ratio threshold instead of fixed static threshold.
+- **Smoother cursor controller:** exponential smoothing + velocity damping + capped motion step.
+- **Interaction layer:**
+  - blink click (left/right click mode),
+  - dwell click,
+  - drag toggle,
+  - on-screen keyboard launcher.
+- **Packaging/reliability:**
+  - modular code split (`gaze/tracker.py`, `gaze/controller.py`, `gaze/calibration.py`, `gaze/interactions.py`),
+  - startup checks with actionable errors for OpenCV/libGL/MediaPipe/pyautogui,
+  - unit tests for non-camera math and interaction logic.
 
 ## Setup
 ```bash
@@ -21,23 +29,35 @@ pip install -r requirements.txt
 python main.py --camera 0 --flip --show-debug
 ```
 
-### Safe first run (recommended)
+Safe first run (no real mouse movement):
 ```bash
 python main.py --dry-run --flip --show-debug
 ```
 
-## Controls
-- Press `q` to quit.
-- Blink naturally to trigger click (tune thresholds below if needed).
+## Runtime controls
+- `q`: quit
+- `c`: start calibration
+- `SPACE`: capture current calibration point
+- `m`: toggle click mode (left/right)
+- `v`: toggle dwell click
+- `g`: toggle drag hold
+- `k`: launch on-screen keyboard (if available)
 
-## Useful tuning flags
-- `--margin 0.15` : keeps edge dead-zones so tiny eye jitter does not slam cursor to edges.
-- `--history 6` : increases smoothing window (higher = smoother, slower).
-- `--blink-threshold 0.20` : lower value makes blink click less sensitive.
-- `--blink-frames 2` : consecutive frames below threshold needed to click.
-- `--click-cooldown 0.6` : min seconds between generated clicks.
+## Useful flags
+- `--calibration-points {5,9}`
+- `--pose-comp-gain 0.08`
+- `--smoothing-alpha 0.35`
+- `--velocity-damping 0.70`
+- `--max-step 120`
+- `--blink-threshold-ratio 0.70`
+- `--baseline-alpha 0.02`
+- `--blink-frames 2`
+- `--dwell-seconds 1.0`
+- `--dwell-radius 45`
+- `--model-path models/face_landmarker.task`
+- `--model-url <url>`
 
-## Notes
-- Good lighting and a stable camera improve performance a lot.
-- If cursor is too sensitive, increase `--history` or `--margin`.
-- If blink clicks are accidental, reduce `--blink-threshold` or increase `--blink-frames`.
+## Tests
+```bash
+python -m unittest discover -s tests -v
+```

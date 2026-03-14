@@ -37,12 +37,12 @@ python main.py --dry-run --flip --show-debug
 ## Runtime controls
 - `q`: quit
 - `c`: start calibration
-- `SPACE`: capture current calibration point
+- `SPACE`: capture curren calibration point
 - `m`: toggle click mode (left/right)
 - `v`: toggle dwell click
 - `g`: toggle drag hold
 - `k`: launch on-screen keyboard (if available)
-
+m
 ## Useful flags
 - `--calibration-points {5,9}`
 - `--pose-comp-gain 0.08`

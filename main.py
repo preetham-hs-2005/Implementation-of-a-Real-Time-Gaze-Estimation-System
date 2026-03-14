@@ -127,6 +127,9 @@ def main() -> None:
     calibration_targets = default_calibration_targets(args.calibration_points)
     calibrating = False
     calibration_index = 0
+    collecting = False
+    samples_collected = 0
+    FRAMES_TO_COLLECT = 15
 
     cursor = CursorSmoother(alpha=args.smoothing_alpha, velocity_damping=args.velocity_damping, max_step=args.max_step)
     blink = AdaptiveBlinkDetector(
@@ -172,20 +175,38 @@ def main() -> None:
                 result = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
                 status = 0
-                if result.face_landmarks:
-                    transform_matrix: Optional[list[list[float]]] = None
-                    if result.facial_transformation_matrixes:
-                        transform_matrix = result.facial_transformation_matrixes[0]
-
-                    obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
-                    gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
-
-                    if calibrating:
-                        tx, ty = calibration_targets[calibration_index]
-                        cv2.circle(frame, (int(tx * width), int(ty * height)), 12, (0, 255, 255), -1)
-                        draw_status(cv2, frame, "Calibration active: look at dot then press SPACE", status)
-                        status += 1
+                if calibrating:
+                    # Create black full-screen image for calibration
+                    import numpy as np
+                    calib_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                    tx, ty = calibration_targets[calibration_index]
+                    target_x, target_y = int(tx * screen_w), int(ty * screen_h)
+                    
+                    # Draw target on the full screen frame
+                    cv2.circle(calib_frame, (target_x, target_y), 30, (0, 255, 255), -1)
+                    cv2.circle(calib_frame, (target_x, target_y), 10, (0, 0, 255), -1)
+                    
+                    if collecting:
+                        msg = f"Capturing... {samples_collected}/{FRAMES_TO_COLLECT}"
                     else:
+                        msg = "Look at the dot and press SPACE"
+                    
+                    cv2.putText(calib_frame, msg, (screen_w // 2 - 200, screen_h // 2), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                    
+                    cv2.imshow("Full Screen Calibration", calib_frame)
+                    
+                    # Also show the camera feed to ensure user knows it's doing something
+                    draw_status(cv2, frame, "Calibration in progress...", status)
+                else:
+                    if result.face_landmarks:
+                        transform_matrix: Optional[list[list[float]]] = None
+                        if result.facial_transformation_matrixes:
+                            transform_matrix = result.facial_transformation_matrixes[0]
+
+                        obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
+                        gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
+
                         mapped_norm = calibration.map(gaze_norm)
                         target_cursor = map_to_screen(mapped_norm[0], mapped_norm[1], screen_w, screen_h, args.margin)
                         smooth_cursor = cursor.update(target_cursor)
@@ -210,16 +231,16 @@ def main() -> None:
                         draw_status(cv2, frame, f"Cursor: ({int(smooth_cursor[0])}, {int(smooth_cursor[1])})", status)
                         status += 1
 
-                    draw_status(cv2, frame, f"EAR: {obs.ear:.3f} baseline: {blink.baseline_ear:.3f}", status)
-                    status += 1
+                        draw_status(cv2, frame, f"EAR: {obs.ear:.3f} baseline: {blink.baseline_ear:.3f}", status)
+                        status += 1
 
-                    if args.show_debug:
-                        cv2.circle(frame, (int(obs.left_iris_px[0]), int(obs.left_iris_px[1])), 4, (255, 0, 0), -1)
-                        cv2.circle(frame, (int(obs.right_iris_px[0]), int(obs.right_iris_px[1])), 4, (0, 0, 255), -1)
-                else:
-                    cursor.reset()
-                    draw_status(cv2, frame, "Face not detected", status)
-                    status += 1
+                        if args.show_debug:
+                            cv2.circle(frame, (int(obs.left_iris_px[0]), int(obs.left_iris_px[1])), 4, (255, 0, 0), -1)
+                            cv2.circle(frame, (int(obs.right_iris_px[0]), int(obs.right_iris_px[1])), 4, (0, 0, 255), -1)
+                    else:
+                        cursor.reset()
+                        draw_status(cv2, frame, "Face not detected", status)
+                        status += 1
 
                 frame_counter += 1
                 if frame_counter >= 10:
@@ -256,17 +277,35 @@ def main() -> None:
                     calibration.clear()
                     calibrating = True
                     calibration_index = 0
-                if calibrating and key == ord(" "):
-                    if result.face_landmarks:
+                    collecting = False
+                    samples_collected = 0
+                    # Create full screen window
+                    cv2.namedWindow("Full Screen Calibration", cv2.WINDOW_NORMAL)
+                    cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    # Force it to the top
+                    cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_TOPMOST, 1)
+
+                if calibrating:
+                    if key == ord(" "):
+                        collecting = True
+                        samples_collected = 0
+                    
+                    if collecting and result.face_landmarks:
                         transform_matrix = result.facial_transformation_matrixes[0] if result.facial_transformation_matrixes else None
                         obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
                         gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
+                        
                         calibration.add_sample(gaze_norm, calibration_targets[calibration_index])
-                        calibration_index += 1
-                        if calibration_index >= len(calibration_targets):
-                            calibration.fit()
-                            calibrating = False
-                            osk_message = "Calibration fitted successfully"
+                        samples_collected += 1
+                        
+                        if samples_collected >= FRAMES_TO_COLLECT:
+                            collecting = False
+                            calibration_index += 1
+                            if calibration_index >= len(calibration_targets):
+                                calibration.fit()
+                                calibrating = False
+                                cv2.destroyWindow("Full Screen Calibration")
+                                osk_message = "Calibration fitted successfully"
     finally:
         if drag.enabled and not args.dry_run:
             try:

@@ -1,6 +1,6 @@
 import unittest
 
-from gaze.controller import CursorSmoother, map_to_screen
+from gaze.controller import CursorSmoother, map_to_screen, apply_sensitivity
 
 
 class ControllerTests(unittest.TestCase):
@@ -15,6 +15,17 @@ class ControllerTests(unittest.TestCase):
         p1 = smoother.update((100, 0))
         self.assertEqual(p0, (0, 0))
         self.assertTrue(0 < p1[0] < 100)
+
+    def test_apply_sensitivity_controls_extent(self):
+        # Low sensitivity should push points toward center
+        x, y = apply_sensitivity(0.9, 0.1, 0.5)
+        self.assertTrue(0.5 < x < 0.9)
+        self.assertTrue(0.1 < y < 0.5)
+
+        # High sensitivity should stretch away from center
+        x2, y2 = apply_sensitivity(0.9, 0.1, 1.5)
+        self.assertTrue(x2 >= x)
+        self.assertTrue(y2 <= y)
 
 
 if __name__ == "__main__":

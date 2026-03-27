@@ -40,6 +40,15 @@ class CursorSmoother:
         return self._position
 
 
+def apply_sensitivity(norm_x: float, norm_y: float, sensitivity: float) -> Point:
+    """Scale gaze movement around screen center to control sensitivity."""
+    sensitivity = max(0.05, min(2.0, sensitivity))
+    cx, cy = 0.5, 0.5
+    x = (norm_x - cx) * sensitivity + cx
+    y = (norm_y - cy) * sensitivity + cy
+    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+
 def map_to_screen(norm_x: float, norm_y: float, screen_w: int, screen_h: int, margin: float) -> Point:
     margin = max(0.0, min(0.4, margin))
     usable = max(0.2, 1.0 - 2.0 * margin)

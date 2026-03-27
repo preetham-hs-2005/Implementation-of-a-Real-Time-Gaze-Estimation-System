@@ -19,6 +19,7 @@ class FaceObservation:
     left_iris_px: Point
     right_iris_px: Point
     transform_matrix: Optional[Sequence[Sequence[float]]]
+    iris_visibility: float
 
 
 def landmark_to_pixel(landmark, width: int, height: int) -> Point:
@@ -56,10 +57,15 @@ def extract_observation(
     left_ear = eye_aspect_ratio(face_landmarks, LEFT_EYE, width, height)
     right_ear = eye_aspect_ratio(face_landmarks, RIGHT_EYE, width, height)
     ear = (left_ear + right_ear) / 2.0
+
+    # MediaPipe FaceLandmarker often does not populate visibility (returns None).
+    # If the face was detected and landmarks exist, we assume the iris is visible enough.
+    iris_visibility = 1.0
     return FaceObservation(
         gaze_norm=gaze_norm,
         ear=ear,
         left_iris_px=left_iris,
         right_iris_px=right_iris,
         transform_matrix=transform_matrix,
+        iris_visibility=iris_visibility,
     )

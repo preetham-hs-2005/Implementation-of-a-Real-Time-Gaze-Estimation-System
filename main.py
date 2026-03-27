@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from gaze.calibration import CalibrationModel, apply_head_pose_compensation, default_calibration_targets
-from gaze.controller import CursorSmoother, map_to_screen
+from gaze.controller import CursorSmoother, map_to_screen, apply_sensitivity
 from gaze.interactions import AdaptiveBlinkDetector, DragState, DwellClickDetector
 from gaze.tracker import extract_observation
 
@@ -26,6 +26,12 @@ DEFAULT_MODEL_URL = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Eye-controlled cursor using latest MediaPipe Face Landmarker.")
     parser.add_argument("--camera", type=int, default=0, help="Camera index.")
+    parser.add_argument(
+        "--camera-backend",
+        choices=["auto", "default", "dshow", "msmf"],
+        default="auto",
+        help="Camera backend on Windows. 'auto' probes multiple backends and prefers a non-black stream.",
+    )
     parser.add_argument("--flip", action="store_true", help="Mirror the frame horizontally.")
     parser.add_argument("--margin", type=float, default=0.15, help="Dead margin from each edge (0-0.4).")
     parser.add_argument("--show-debug", action="store_true", help="Show landmarks and tracking overlays.")
@@ -44,7 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dwell-radius", type=float, default=45.0, help="Movement radius for dwell trigger.")
 
     parser.add_argument("--calibration-points", type=int, default=9, choices=[5, 9], help="Calibration grid size.")
-    parser.add_argument("--pose-comp-gain", type=float, default=0.08, help="Head-pose compensation gain.")
+    parser.add_argument("--pose-comp-gain", type=float, default=0.0, help="Head-pose compensation gain (0.0 to disable, higher for more head-motion effect).")
+    parser.add_argument("--disable-pose-comp", action="store_true", help="Disable head-pose compensation entirely.")
+    parser.add_argument("--gaze-smoothing-alpha", type=float, default=0.20, help="Gaze low-pass alpha (0.0-1.0), smaller is smoother.")
+    parser.add_argument("--sensitivity", type=float, default=1.0, help="Gaze-to-cursor sensitivity scale (0.05-2.0, default 1.0).")
 
     parser.add_argument("--model-path", default="models/face_landmarker.task", help="Path to face_landmarker.task.")
     parser.add_argument("--model-url", default=DEFAULT_MODEL_URL, help="Model URL for first-run download.")
@@ -71,6 +80,7 @@ def import_runtime_dependencies():
     try:
         import mediapipe as mp
     except Exception as exc:
+        print(f"MediaPipe import error: {exc}")
         raise RuntimeError("MediaPipe import failed. Run: pip install -r requirements.txt") from exc
 
     try:
@@ -83,6 +93,113 @@ def import_runtime_dependencies():
 
 def draw_status(cv2, frame, text: str, line: int) -> None:
     cv2.putText(frame, text, (10, 24 + line * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+
+def normalize_key(key: int) -> int:
+    if key < 0:
+        return key
+    key &= 0xFF
+    if 65 <= key <= 90:
+        key += 32
+    return key
+
+
+def _backend_candidates(cv2, backend_name: str) -> list[tuple[str, Optional[int]]]:
+    if not platform.system().lower().startswith("win"):
+        return [("default", None)]
+
+    backend_map = {
+        "default": [("default", None)],
+        "dshow": [("dshow", cv2.CAP_DSHOW)],
+        "msmf": [("msmf", cv2.CAP_MSMF)],
+        # Windows cameras can behave differently across backends.
+        # Prefer generic auto-selection first, then common explicit backends.
+        "auto": [("default", None), ("dshow", cv2.CAP_DSHOW), ("msmf", cv2.CAP_MSMF)],
+    }
+    return backend_map[backend_name]
+
+
+def _probe_capture_stream(cv2, cap, num_frames: int = 3) -> tuple[bool, float]:
+    max_mean = 0.0
+    any_frame = False
+    for _ in range(num_frames):
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        any_frame = True
+        max_mean = max(max_mean, float(frame.mean()))
+    return any_frame, max_mean
+
+
+def _try_open_camera(cv2, camera_index: int, backend_name: str, accept_dark_stream: bool = False):
+    attempts: list[str] = []
+    best_dark = None
+    for backend_label, backend_flag in _backend_candidates(cv2, backend_name):
+        cap = cv2.VideoCapture(camera_index) if backend_flag is None else cv2.VideoCapture(camera_index, backend_flag)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        if not cap.isOpened():
+            attempts.append(f"{backend_label}: could not open")
+            cap.release()
+            continue
+
+        any_frame, max_mean = _probe_capture_stream(cv2, cap)
+        if any_frame and (accept_dark_stream or max_mean > 3.0):
+            print(f"[INFO] Camera opened with backend '{backend_label}' on index {camera_index} (brightness {max_mean:.1f}).")
+            return cap, attempts
+
+        attempts.append(
+            f"{backend_label}: {'no frames' if not any_frame else f'frames too dark (brightness {max_mean:.1f})'}"
+        )
+        if any_frame and (best_dark is None or max_mean > best_dark[0]):
+            best_dark = (max_mean, backend_label, cap)
+        else:
+            cap.release()
+
+    if best_dark is not None:
+        brightness, backend_label, cap = best_dark
+        print(
+            f"[WARN] Using dark camera stream from index {camera_index} with backend '{backend_label}' "
+            f"(brightness {brightness:.1f}) because no brighter stream was found."
+        )
+        return cap, attempts
+
+    return None, attempts
+
+
+def open_camera(cv2, camera_index: int, backend_name: str):
+    if platform.system().lower().startswith("win") and backend_name == "default":
+        cap = cv2.VideoCapture(camera_index)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        if cap.isOpened():
+            print(f"[INFO] Camera opened with backend 'default' on index {camera_index}.")
+            return cap
+        cap.release()
+
+    cap, attempts = _try_open_camera(cv2, camera_index, backend_name, accept_dark_stream=True)
+    if cap is not None:
+        return cap
+
+    if platform.system().lower().startswith("win") and backend_name in {"auto", "default"}:
+        print(f"[WARN] Requested camera index {camera_index} was unusable. Scanning nearby indices...")
+        for fallback_index in range(6):
+            if fallback_index == camera_index:
+                continue
+            cap, fallback_attempts = _try_open_camera(cv2, fallback_index, "auto", accept_dark_stream=False)
+            attempts.extend([f"index {fallback_index} {item}" for item in fallback_attempts])
+            if cap is not None:
+                print(f"[INFO] Falling back to camera index {fallback_index}.")
+                return cap
+
+    attempted = "; ".join(attempts) if attempts else "no backends attempted"
+    raise RuntimeError(
+        f"Unable to get a usable camera stream from index {camera_index}. Attempts: {attempted}. "
+        "Try --camera-backend default or a different --camera index."
+    )
 
 
 def launch_on_screen_keyboard() -> str:
@@ -116,9 +233,10 @@ def main() -> None:
     FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
     RunningMode = mp.tasks.vision.RunningMode
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise RuntimeError("Unable to open camera. Try a different --camera index.")
+    print("[INFO] Opening camera, this may take 1-3 seconds...")
+    cap = open_camera(cv2, args.camera, args.camera_backend)
+
+    print("[INFO] Camera opened, initializing model...")
 
     pyautogui.FAILSAFE = False
     screen_w, screen_h = pyautogui.size()
@@ -132,6 +250,7 @@ def main() -> None:
     FRAMES_TO_COLLECT = 15
 
     cursor = CursorSmoother(alpha=args.smoothing_alpha, velocity_damping=args.velocity_damping, max_step=args.max_step)
+    prev_gaze_norm = None
     blink = AdaptiveBlinkDetector(
         baseline_alpha=args.baseline_alpha,
         threshold_ratio=args.blink_threshold_ratio,
@@ -160,19 +279,35 @@ def main() -> None:
     frame_counter = 0
     fps = 0.0
 
+    print("[INFO] Creating FaceLandmarker model (this may take several seconds)...")
     try:
         with FaceLandmarker.create_from_options(options) as face_landmarker:
+            print("[INFO] FaceLandmarker model is ready. Starting capture loop.")
+            window_name = "Gaze Cursor Control"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 960, 720)
+            if platform.system().lower().startswith("win"):
+                cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+            frame_count = 0
             while True:
                 ret, frame = cap.read()
                 if not ret:
+                    print("[ERROR] Failed to read frame from camera")
                     break
+                frame_count += 1
+                if frame_count % 30 == 0:  # Print every 30 frames
+                    print(f"[INFO] Processing frame {frame_count}")
                 if args.flip:
                     frame = cv2.flip(frame, 1)
 
                 height, width = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                result = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+                try:
+                    result = face_landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+                except Exception as e:
+                    print(f"[ERROR] Face detection failed: {e}")
+                    result = None
 
                 status = 0
                 if calibrating:
@@ -205,33 +340,57 @@ def main() -> None:
                             transform_matrix = result.facial_transformation_matrixes[0]
 
                         obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
-                        gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
 
-                        mapped_norm = calibration.map(gaze_norm)
-                        target_cursor = map_to_screen(mapped_norm[0], mapped_norm[1], screen_w, screen_h, args.margin)
-                        smooth_cursor = cursor.update(target_cursor)
-                        if not args.dry_run:
-                            pyautogui.moveTo(smooth_cursor[0], smooth_cursor[1], _pause=False)
+                        if obs.iris_visibility < 0.5:
+                            draw_status(cv2, frame, "Iris not visible clearly - adjust lighting/position", status)
+                            status += 1
+                            cursor.reset()
+                        else:
+                            gaze_norm = obs.gaze_norm
+                            # Optional head-pose compensation can be disabled for less head-motion effect
+                            if not args.disable_pose_comp and args.pose_comp_gain > 0.0:
+                                gaze_norm = apply_head_pose_compensation(gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
 
-                        if blink.update(obs.ear, time.time()):
+                            # Soft gaze smoothing to reduce frame jitter
+                            if prev_gaze_norm is None:
+                                smoothed_gaze = gaze_norm
+                            else:
+                                a = max(0.0, min(1.0, args.gaze_smoothing_alpha))
+                                smoothed_gaze = (
+                                    prev_gaze_norm[0] * (1.0 - a) + gaze_norm[0] * a,
+                                    prev_gaze_norm[1] * (1.0 - a) + gaze_norm[1] * a,
+                                )
+                            prev_gaze_norm = smoothed_gaze
+
+                            mapped_norm = calibration.map(smoothed_gaze)
+                            adjusted_norm = apply_sensitivity(mapped_norm[0], mapped_norm[1], args.sensitivity)
+                            target_cursor = map_to_screen(adjusted_norm[0], adjusted_norm[1], screen_w, screen_h, args.margin)
+                            smooth_cursor = cursor.update(target_cursor)
                             if not args.dry_run:
-                                if click_mode == "left":
-                                    pyautogui.click(button="left")
-                                else:
-                                    pyautogui.click(button="right")
-                            draw_status(cv2, frame, f"Blink {click_mode} click", status)
+                                pyautogui.moveTo(smooth_cursor[0], smooth_cursor[1], _pause=False)
+
+                            if blink.update(obs.ear, time.time()):
+                                if not args.dry_run:
+                                    if click_mode == "left":
+                                        pyautogui.click(button="left")
+                                    else:
+                                        pyautogui.click(button="right")
+                                draw_status(cv2, frame, f"Blink {click_mode} click", status)
+                                status += 1
+
+                            if dwell_enabled and dwell.update(smooth_cursor, time.time()):
+                                if not args.dry_run:
+                                    pyautogui.click(button=click_mode)
+                                draw_status(cv2, frame, f"Dwell {click_mode} click", status)
+                                status += 1
+
+                            draw_status(cv2, frame, f"Cursor: ({int(smooth_cursor[0])}, {int(smooth_cursor[1])})", status)
                             status += 1
 
-                        if dwell_enabled and dwell.update(smooth_cursor, time.time()):
-                            if not args.dry_run:
-                                pyautogui.click(button=click_mode)
-                            draw_status(cv2, frame, f"Dwell {click_mode} click", status)
+                            draw_status(cv2, frame, f"EAR: {obs.ear:.3f} baseline: {blink.baseline_ear:.3f}", status)
                             status += 1
 
-                        draw_status(cv2, frame, f"Cursor: ({int(smooth_cursor[0])}, {int(smooth_cursor[1])})", status)
-                        status += 1
-
-                        draw_status(cv2, frame, f"EAR: {obs.ear:.3f} baseline: {blink.baseline_ear:.3f}", status)
+                        draw_status(cv2, frame, f"Iris visibility: {obs.iris_visibility:.2f}", status)
                         status += 1
 
                         if args.show_debug:
@@ -258,8 +417,10 @@ def main() -> None:
                     status += 1
                 draw_status(cv2, frame, "q quit | c calib | m click-mode | v dwell | g drag | k keyboard", status)
 
-                cv2.imshow("Gaze Cursor Control", frame)
-                key = cv2.waitKey(1) & 0xFF
+                cv2.imshow(window_name, frame)
+                if frame_count == 1:
+                    print("[INFO] Window should be visible now. Press 'q' to quit.")
+                key = normalize_key(cv2.waitKeyEx(10))
                 if key == ord("q"):
                     break
                 if key == ord("m"):

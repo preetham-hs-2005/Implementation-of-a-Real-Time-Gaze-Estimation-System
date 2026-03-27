@@ -32,14 +32,18 @@ class CalibrationModel:
     def is_fitted(self) -> bool:
         return self.coef_x is not None and self.coef_y is not None
 
-    def fit(self) -> None:
+    def fit(self, regularization: float = 1e-5) -> None:
         if len(self.points) < 5:
             raise ValueError("Need at least 5 samples for calibration fit.")
         features = np.stack([_poly_features(gx, gy) for (gx, gy), _ in self.points], axis=0)
         target_x = np.array([sx for _, (sx, _) in self.points], dtype=np.float64)
         target_y = np.array([sy for _, (_, sy) in self.points], dtype=np.float64)
-        self.coef_x, *_ = np.linalg.lstsq(features, target_x, rcond=None)
-        self.coef_y, *_ = np.linalg.lstsq(features, target_y, rcond=None)
+
+        # Regularized least squares for more stable calibration, reducing over-sensitive overfitting.
+        xtx = features.T @ features
+        reg_mat = np.eye(xtx.shape[0], dtype=np.float64) * regularization
+        self.coef_x = np.linalg.solve(xtx + reg_mat, features.T @ target_x)
+        self.coef_y = np.linalg.solve(xtx + reg_mat, features.T @ target_y)
 
     def map(self, gaze_norm: Point) -> Point:
         if not self.is_fitted:

@@ -7,6 +7,8 @@ A real-time IPCV project for gaze-based mouse control with calibration, head-pos
 - **Head-pose compensation:** uses MediaPipe facial transform matrix to reduce drift.
 - **Adaptive blink detection:** per-user EAR baseline + ratio threshold instead of fixed static threshold.
 - **Smoother cursor controller:** exponential smoothing + velocity damping + capped motion step.
+- **Precision motion shaping:** center deadzone + non-linear response to reduce oversensitive cursor motion.
+- **WebGazer-style refinement:** short prediction history smoothing plus ongoing calibration updates from user interactions.
 - **Interaction layer:**
   - blink click (left/right click mode),
   - dwell click,
@@ -37,7 +39,7 @@ python main.py --dry-run --flip --show-debug
 ## Runtime controls
 - `q`: quit
 - `c`: start calibration
-- `SPACE`: capture curren calibration point
+- `SPACE`: capture the current calibration dot (records 15 frames, then advances)
 - `m`: toggle click mode (left/right)
 - `v`: toggle dwell click
 - `g`: toggle drag hold
@@ -45,10 +47,18 @@ python main.py --dry-run --flip --show-debug
 m
 ## Useful flags
 - `--calibration-points {5,9}`
+- `--margin 0.02`
+- `--calibration-frames 15`
+- `--prediction-window 4`
+- `--disable-interaction-learning`
 - `--pose-comp-gain 0.08`
-- `--smoothing-alpha 0.35`
-- `--velocity-damping 0.70`
-- `--max-step 120`
+- `--smoothing-alpha 0.28`
+- `--velocity-damping 0.78`
+- `--max-step 90`
+- `--gaze-smoothing-alpha 0.16`
+- `--sensitivity 1.0`
+- `--deadzone 0.025`
+- `--precision-curve 1.35`
 - `--blink-threshold-ratio 0.70`
 - `--baseline-alpha 0.02`
 - `--blink-frames 2`

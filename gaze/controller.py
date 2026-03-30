@@ -112,6 +112,28 @@ def apply_sensitivity(norm_x: float, norm_y: float, sensitivity: float) -> Point
     return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
 
 
+def apply_precision_curve(norm_x: float, norm_y: float, deadzone: float, curve_power: float) -> Point:
+    """Suppress tiny gaze jitter near center while preserving edge reach."""
+    deadzone = max(0.0, min(0.3, deadzone))
+    curve_power = max(1.0, min(4.0, curve_power))
+    cx, cy = 0.5, 0.5
+
+    def transform(value: float, center: float) -> float:
+        offset = value - center
+        distance = abs(offset)
+        if distance <= deadzone:
+            return center
+
+        usable = max(1e-6, 0.5 - deadzone)
+        normalized = min(1.0, (distance - deadzone) / usable)
+        curved = normalized ** curve_power
+        return center + (1.0 if offset >= 0.0 else -1.0) * curved * 0.5
+
+    x = transform(norm_x, cx)
+    y = transform(norm_y, cy)
+    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+
 def map_to_screen(norm_x: float, norm_y: float, screen_w: int, screen_h: int, margin: float) -> Point:
     margin = max(0.0, min(0.3, margin))
 

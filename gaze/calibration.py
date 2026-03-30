@@ -5,7 +5,10 @@ import math
 import random
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-import cv2 as _cv2
+try:
+    import cv2 as _cv2
+except ModuleNotFoundError:  # pragma: no cover - optional during unit tests
+    _cv2 = None
 import numpy as np
 
 Point = Tuple[float, float]
@@ -93,8 +96,17 @@ class HomographyCalibrationModel:
         return self.H is not None or (self.fallback is not None and self.fallback.is_fitted)
 
     def fit(self) -> None:
+<<<<<<< HEAD
         self.H = None
         self.H_inv = None
+=======
+        if _cv2 is None:
+            if self.fallback is not None:
+                print("[CALIB] OpenCV unavailable. Falling back to polynomial fit.")
+                self.fallback.fit()
+                return
+            raise RuntimeError("OpenCV is required for homography calibration.")
+>>>>>>> b66aadb8d542aa5d936cd64a2bf6983ce88d561e
         if len(self.points) < 8:
             if self.fallback is not None:
                 print("[CALIB] Homography unavailable (<8 points). Falling back to polynomial fit.")

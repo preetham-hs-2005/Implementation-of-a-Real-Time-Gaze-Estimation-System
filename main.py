@@ -523,6 +523,8 @@ def main() -> None:
                 smoothed_angles: Optional[tuple[float, float]] = None
                 mapped_norm: Optional[tuple[float, float]] = None
                 gaze_state = "fixation"
+                blink_clicked = False
+                frame_now = time.time()
                 
                 if result and result.face_landmarks:
                     obs = extract_observation(
@@ -647,6 +649,16 @@ def main() -> None:
                         draw_status(cv2, frame, f"Gaze calibration point {calibration_index + 1}/{len(calibration_targets)}", status)
                         status += 1
 
+                    if (
+                        gaze_control_enabled
+                        and calibration.is_fitted
+                        and not calibrating
+                        and blink.update(obs.ear, frame_now)
+                    ):
+                        if not args.dry_run:
+                            pyautogui.click(button=click_mode)
+                        blink_clicked = True
+
                     if obs.iris_visibility < 0.5:
                         draw_status(cv2, frame, "Iris not visible clearly - adjust lighting/position", status)
                         status += 1
@@ -669,20 +681,15 @@ def main() -> None:
                         # The FixationDetector tracks the state for logging,
                         # but we let the One-Euro filter handle all the smoothing.
                         # It naturally allows fast jump during saccade and heavy filtering during fixation.
-                        smooth_cursor = cursor.update(target_cursor, time.time(), screen_w=screen_w, screen_h=screen_h)
+                        smooth_cursor = cursor.update(target_cursor, frame_now, screen_w=screen_w, screen_h=screen_h)
                         if gaze_control_enabled and not args.dry_run:
                             pyautogui.moveTo(smooth_cursor[0], smooth_cursor[1], _pause=False)
 
-                        if gaze_control_enabled and blink.update(obs.ear, time.time()):
-                            if not args.dry_run:
-                                if click_mode == "left":
-                                    pyautogui.click(button="left")
-                                else:
-                                    pyautogui.click(button="right")
+                        if blink_clicked:
                             draw_status(cv2, frame, f"Blink {click_mode} click", status)
                             status += 1
 
-                        if gaze_control_enabled and dwell_enabled and dwell.update(smooth_cursor, time.time()):
+                        if gaze_control_enabled and dwell_enabled and dwell.update(smooth_cursor, frame_now):
                             stable_anchor_norm = (
                                 smooth_cursor[0] / max(float(screen_w), 1.0),
                                 smooth_cursor[1] / max(float(screen_h), 1.0),

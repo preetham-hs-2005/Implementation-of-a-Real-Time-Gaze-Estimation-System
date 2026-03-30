@@ -1,6 +1,6 @@
 import unittest
 
-from gaze.controller import CursorSmoother, map_to_screen, apply_sensitivity
+from gaze.controller import CursorSmoother, apply_precision_curve, map_to_screen, apply_sensitivity
 
 
 class ControllerTests(unittest.TestCase):
@@ -26,6 +26,15 @@ class ControllerTests(unittest.TestCase):
         x2, y2 = apply_sensitivity(0.9, 0.1, 1.5)
         self.assertTrue(x2 >= x)
         self.assertTrue(y2 <= y)
+
+    def test_precision_curve_holds_small_center_motion(self):
+        x, y = apply_precision_curve(0.52, 0.48, deadzone=0.04, curve_power=1.8)
+        self.assertEqual((x, y), (0.5, 0.5))
+
+    def test_precision_curve_preserves_large_movement(self):
+        x, y = apply_precision_curve(0.9, 0.1, deadzone=0.04, curve_power=1.8)
+        self.assertTrue(0.5 < x <= 1.0)
+        self.assertTrue(0.0 <= y < 0.5)
 
 
 if __name__ == "__main__":

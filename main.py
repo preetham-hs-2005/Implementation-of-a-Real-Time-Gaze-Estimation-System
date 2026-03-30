@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import platform
 import subprocess
 import sys
@@ -11,8 +12,8 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from gaze.calibration import CalibrationModel, apply_head_pose_compensation, default_calibration_targets
-from gaze.controller import CursorSmoother, map_to_screen, apply_sensitivity
+from gaze.calibration import CalibrationModel, apply_head_pose_compensation, average_points, default_calibration_targets, is_stable_gaze
+from gaze.controller import CursorSmoother, apply_precision_curve, map_to_screen, apply_sensitivity
 from gaze.interactions import AdaptiveBlinkDetector, DragState, DwellClickDetector
 from gaze.tracker import extract_observation
 
@@ -33,13 +34,13 @@ def parse_args() -> argparse.Namespace:
         help="Camera backend on Windows. 'auto' probes multiple backends and prefers a non-black stream.",
     )
     parser.add_argument("--flip", action="store_true", help="Mirror the frame horizontally.")
-    parser.add_argument("--margin", type=float, default=0.15, help="Dead margin from each edge (0-0.4).")
+    parser.add_argument("--margin", type=float, default=0.02, help="Dead margin from each edge (0-0.4).")
     parser.add_argument("--show-debug", action="store_true", help="Show landmarks and tracking overlays.")
     parser.add_argument("--dry-run", action="store_true", help="Do not move/click cursor, only visualize.")
 
-    parser.add_argument("--smoothing-alpha", type=float, default=0.35, help="EMA smoothing alpha for cursor.")
-    parser.add_argument("--velocity-damping", type=float, default=0.70, help="Velocity damping for smooth cursor.")
-    parser.add_argument("--max-step", type=float, default=120.0, help="Max cursor step per frame.")
+    parser.add_argument("--smoothing-alpha", type=float, default=0.28, help="EMA smoothing alpha for cursor.")
+    parser.add_argument("--velocity-damping", type=float, default=0.78, help="Velocity damping for smooth cursor.")
+    parser.add_argument("--max-step", type=float, default=90.0, help="Max cursor step per frame.")
 
     parser.add_argument("--blink-frames", type=int, default=2, help="Consecutive low-EAR frames for click.")
     parser.add_argument("--click-cooldown", type=float, default=0.6, help="Seconds between clicks.")
@@ -50,10 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dwell-radius", type=float, default=45.0, help="Movement radius for dwell trigger.")
 
     parser.add_argument("--calibration-points", type=int, default=9, choices=[5, 9], help="Calibration grid size.")
+    parser.add_argument("--calibration-frames", type=int, default=15, help="Frames to average after pressing SPACE for each calibration dot.")
     parser.add_argument("--pose-comp-gain", type=float, default=0.0, help="Head-pose compensation gain (0.0 to disable, higher for more head-motion effect).")
     parser.add_argument("--disable-pose-comp", action="store_true", help="Disable head-pose compensation entirely.")
-    parser.add_argument("--gaze-smoothing-alpha", type=float, default=0.20, help="Gaze low-pass alpha (0.0-1.0), smaller is smoother.")
+    parser.add_argument("--gaze-smoothing-alpha", type=float, default=0.16, help="Gaze low-pass alpha (0.0-1.0), smaller is smoother.")
     parser.add_argument("--sensitivity", type=float, default=1.0, help="Gaze-to-cursor sensitivity scale (0.05-2.0, default 1.0).")
+    parser.add_argument("--deadzone", type=float, default=0.025, help="Ignore tiny gaze motion near center (0.0-0.3).")
+    parser.add_argument("--precision-curve", type=float, default=1.35, help="Non-linear cursor response outside deadzone (1.0-4.0).")
+    parser.add_argument("--prediction-window", type=int, default=4, help="Average this many recent predictions for steadier cursor control.")
+    parser.add_argument("--disable-interaction-learning", action="store_true", help="Disable continuous calibration updates from blink and dwell interactions.")
 
     parser.add_argument("--model-path", default="models/face_landmarker.task", help="Path to face_landmarker.task.")
     parser.add_argument("--model-url", default=DEFAULT_MODEL_URL, help="Model URL for first-run download.")
@@ -247,10 +253,11 @@ def main() -> None:
     calibration_index = 0
     collecting = False
     samples_collected = 0
-    FRAMES_TO_COLLECT = 15
+    calibration_recent_samples: list[tuple[float, float]] = []
 
     cursor = CursorSmoother(alpha=args.smoothing_alpha, velocity_damping=args.velocity_damping, max_step=args.max_step)
     prev_gaze_norm = None
+    prediction_history: deque[tuple[float, float]] = deque(maxlen=max(1, args.prediction_window))
     blink = AdaptiveBlinkDetector(
         baseline_alpha=args.baseline_alpha,
         threshold_ratio=args.blink_threshold_ratio,
@@ -322,7 +329,7 @@ def main() -> None:
                     cv2.circle(calib_frame, (target_x, target_y), 10, (0, 0, 255), -1)
                     
                     if collecting:
-                        msg = f"Capturing... {samples_collected}/{FRAMES_TO_COLLECT}"
+                        msg = f"Capturing... {samples_collected}/{args.calibration_frames}"
                     else:
                         msg = "Look at the dot and press SPACE"
                     
@@ -345,6 +352,7 @@ def main() -> None:
                             draw_status(cv2, frame, "Iris not visible clearly - adjust lighting/position", status)
                             status += 1
                             cursor.reset()
+                            prediction_history.clear()
                         else:
                             gaze_norm = obs.gaze_norm
                             # Optional head-pose compensation can be disabled for less head-motion effect
@@ -363,9 +371,16 @@ def main() -> None:
                             prev_gaze_norm = smoothed_gaze
 
                             mapped_norm = calibration.map(smoothed_gaze)
+                            prediction_history.append(mapped_norm)
+                            mapped_norm = average_points(list(prediction_history))
                             adjusted_norm = apply_sensitivity(mapped_norm[0], mapped_norm[1], args.sensitivity)
+                            adjusted_norm = apply_precision_curve(adjusted_norm[0], adjusted_norm[1], args.deadzone, args.precision_curve)
                             target_cursor = map_to_screen(adjusted_norm[0], adjusted_norm[1], screen_w, screen_h, args.margin)
                             smooth_cursor = cursor.update(target_cursor)
+                            cursor_norm = (
+                                max(0.0, min(1.0, smooth_cursor[0] / max(screen_w, 1))),
+                                max(0.0, min(1.0, smooth_cursor[1] / max(screen_h, 1))),
+                            )
                             if not args.dry_run:
                                 pyautogui.moveTo(smooth_cursor[0], smooth_cursor[1], _pause=False)
 
@@ -375,12 +390,16 @@ def main() -> None:
                                         pyautogui.click(button="left")
                                     else:
                                         pyautogui.click(button="right")
+                                if not args.disable_interaction_learning:
+                                    calibration.refine_from_interaction(smoothed_gaze, cursor_norm)
                                 draw_status(cv2, frame, f"Blink {click_mode} click", status)
                                 status += 1
 
                             if dwell_enabled and dwell.update(smooth_cursor, time.time()):
                                 if not args.dry_run:
                                     pyautogui.click(button=click_mode)
+                                if not args.disable_interaction_learning:
+                                    calibration.refine_from_interaction(smoothed_gaze, cursor_norm)
                                 draw_status(cv2, frame, f"Dwell {click_mode} click", status)
                                 status += 1
 
@@ -398,6 +417,7 @@ def main() -> None:
                             cv2.circle(frame, (int(obs.right_iris_px[0]), int(obs.right_iris_px[1])), 4, (0, 0, 255), -1)
                     else:
                         cursor.reset()
+                        prediction_history.clear()
                         draw_status(cv2, frame, "Face not detected", status)
                         status += 1
 
@@ -440,6 +460,8 @@ def main() -> None:
                     calibration_index = 0
                     collecting = False
                     samples_collected = 0
+                    calibration_recent_samples = []
+                    prediction_history.clear()
                     # Create full screen window
                     cv2.namedWindow("Full Screen Calibration", cv2.WINDOW_NORMAL)
                     cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -450,23 +472,37 @@ def main() -> None:
                     if key == ord(" "):
                         collecting = True
                         samples_collected = 0
-                    
+                        calibration_recent_samples = []
+
                     if collecting and result.face_landmarks:
                         transform_matrix = result.facial_transformation_matrixes[0] if result.facial_transformation_matrixes else None
                         obs = extract_observation(result.face_landmarks[0], transform_matrix, width, height)
-                        gaze_norm = apply_head_pose_compensation(obs.gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
-                        
-                        calibration.add_sample(gaze_norm, calibration_targets[calibration_index])
-                        samples_collected += 1
-                        
-                        if samples_collected >= FRAMES_TO_COLLECT:
-                            collecting = False
-                            calibration_index += 1
-                            if calibration_index >= len(calibration_targets):
-                                calibration.fit()
-                                calibrating = False
-                                cv2.destroyWindow("Full Screen Calibration")
-                                osk_message = "Calibration fitted successfully"
+                        if obs.iris_visibility < 0.5:
+                            calibration_recent_samples = []
+                            samples_collected = 0
+                        else:
+                            gaze_norm = obs.gaze_norm
+                            if not args.disable_pose_comp and args.pose_comp_gain > 0.0:
+                                gaze_norm = apply_head_pose_compensation(gaze_norm, obs.transform_matrix, gain=args.pose_comp_gain)
+                            calibration_recent_samples.append(gaze_norm)
+                            calibration_recent_samples = calibration_recent_samples[-args.calibration_frames:]
+                            samples_collected = len(calibration_recent_samples)
+
+                            if samples_collected >= args.calibration_frames:
+                                stable_samples = calibration_recent_samples
+                                if is_stable_gaze(calibration_recent_samples, 0.03):
+                                    stable_samples = calibration_recent_samples
+                                sample = average_points(stable_samples or [gaze_norm])
+                                calibration.add_sample(sample, calibration_targets[calibration_index])
+                                calibration_index += 1
+                                collecting = False
+                                samples_collected = 0
+                                calibration_recent_samples = []
+                                if calibration_index >= len(calibration_targets):
+                                    calibration.fit()
+                                    calibrating = False
+                                    cv2.destroyWindow("Full Screen Calibration")
+                                    osk_message = "Calibration fitted successfully"
     finally:
         if drag.enabled and not args.dry_run:
             try:

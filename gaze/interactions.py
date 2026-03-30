@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 
 
 @dataclass
@@ -66,3 +67,53 @@ class DragState:
     def toggle(self) -> bool:
         self.enabled = not self.enabled
         return self.enabled
+
+
+@dataclass
+class FixationDetector:
+    """
+    Classifies gaze as fixation / saccade / stabilising from angular velocity.
+    """
+
+    saccade_threshold_rad_s: float = 0.35
+    stabilisation_frames: int = 3
+    history_size: int = 3
+    _angle_history: list = field(default_factory=list)
+    _saccade_active: bool = False
+    _stabilisation_counter: int = 0
+    _last_velocity: float = 0.0
+
+    def update(self, angle_x: float, angle_y: float, timestamp: float) -> str:
+        self._angle_history.append((angle_x, angle_y, timestamp))
+        if len(self._angle_history) > self.history_size:
+            self._angle_history.pop(0)
+
+        if len(self._angle_history) < 2:
+            return "fixation"
+
+        old_x, old_y, old_t = self._angle_history[0]
+        new_x, new_y, new_t = self._angle_history[-1]
+        dt = max(new_t - old_t, 1e-6)
+        dangle = math.sqrt((new_x - old_x) ** 2 + (new_y - old_y) ** 2)
+        velocity = dangle / dt
+        self._last_velocity = velocity
+
+        if velocity > self.saccade_threshold_rad_s:
+            self._saccade_active = True
+            self._stabilisation_counter = self.stabilisation_frames
+            return "saccade"
+
+        if self._stabilisation_counter > 0:
+            self._stabilisation_counter -= 1
+            return "stabilising"
+
+        self._saccade_active = False
+        return "fixation"
+
+    @property
+    def is_fixating(self) -> bool:
+        return (not self._saccade_active) and self._stabilisation_counter == 0
+
+    @property
+    def velocity(self) -> float:
+        return self._last_velocity

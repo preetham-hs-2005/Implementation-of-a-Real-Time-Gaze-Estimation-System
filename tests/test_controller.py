@@ -1,6 +1,8 @@
 import unittest
 
-from gaze.controller import CursorSmoother, apply_precision_curve, map_to_screen, apply_sensitivity
+import numpy as np
+
+from gaze.controller import CursorSmoother, HeadPoseSmoother, map_to_screen, apply_sensitivity
 
 
 class ControllerTests(unittest.TestCase):
@@ -10,11 +12,17 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(0 <= y <= 1080)
 
     def test_smoother_moves_towards_target(self):
-        smoother = CursorSmoother(alpha=0.5, velocity_damping=0.5, max_step=1000)
-        p0 = smoother.update((0, 0))
-        p1 = smoother.update((100, 0))
+        smoother = CursorSmoother(min_cutoff=1.0, beta=0.0, d_cutoff=1.0, dead_zone=0.0)
+        p0 = smoother.update((0, 0), 0.0)
+        p1 = smoother.update((100, 0), 0.016)
         self.assertEqual(p0, (0, 0))
         self.assertTrue(0 < p1[0] < 100)
+
+    def test_one_euro_filter_has_no_overshoot_for_step(self):
+        smoother = CursorSmoother(min_cutoff=0.8, beta=0.005, d_cutoff=1.0, dead_zone=0.0)
+        smoother.update((0.0, 0.0), 0.0)
+        outputs = [smoother.update((100.0, 0.0), 0.016 * (i + 1))[0] for i in range(10)]
+        self.assertTrue(all(0.0 <= value <= 100.0 for value in outputs))
 
     def test_apply_sensitivity_controls_extent(self):
         # Low sensitivity should push points toward center
@@ -27,14 +35,17 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(x2 >= x)
         self.assertTrue(y2 <= y)
 
-    def test_precision_curve_holds_small_center_motion(self):
-        x, y = apply_precision_curve(0.52, 0.48, deadzone=0.04, curve_power=1.8)
-        self.assertEqual((x, y), (0.5, 0.5))
-
-    def test_precision_curve_preserves_large_movement(self):
-        x, y = apply_precision_curve(0.9, 0.1, deadzone=0.04, curve_power=1.8)
-        self.assertTrue(0.5 < x <= 1.0)
-        self.assertTrue(0.0 <= y < 0.5)
+    def test_head_pose_smoother_reduces_jump(self):
+        smoother = HeadPoseSmoother(alpha=0.25)
+        identity = np.eye(3)
+        p0, r0 = smoother.update(0.0, 0.0, 0.0, identity)
+        rotation = np.array([[0.99, 0.0, 0.1], [0.0, 1.0, 0.0], [-0.1, 0.0, 0.99]])
+        p1, r1 = smoother.update(1.0, -1.0, 0.5, rotation)
+        self.assertEqual(p0, (0.0, 0.0, 0.0))
+        self.assertTrue(0.0 < p1[0] < 1.0)
+        self.assertTrue(-1.0 < p1[1] < 0.0)
+        self.assertEqual(len(r0), 3)
+        self.assertAlmostEqual(np.linalg.det(np.array(r1)), 1.0, places=5)
 
 
 if __name__ == "__main__":

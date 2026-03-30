@@ -13,12 +13,12 @@ Point = Tuple[float, float]
 class CursorSmoother:
     """One-Euro filter for low-latency, non-overshooting cursor motion."""
 
-    min_cutoff: float = 1.5
-    beta: float = 0.005
+    min_cutoff: float = 0.8
+    beta: float = 0.01
     d_cutoff: float = 1.0
     speed_scale: float = 1.0
     dead_zone: float = 0.005
-    max_cursor_speed: float = 0.018
+    max_cursor_speed: float = 0.08
     _x: Optional[Point] = None
     _dx: Point = (0.0, 0.0)
     _last_time: float = 0.0
@@ -84,40 +84,23 @@ class CursorSmoother:
 
 
 @dataclass
-class HeadPoseSmoother:
+class RotationSmoother:
     alpha: float = 0.25
-    _angles: Optional[tuple[float, float, float]] = None
-    _rotation_matrix: Optional[np.ndarray] = None
+    _R_smooth: Optional[np.ndarray] = None
+
+    def update(self, R: np.ndarray) -> np.ndarray:
+        if self._R_smooth is None:
+            self._R_smooth = R.copy()
+            return R
+        # Element-wise EMA
+        R_blended = (1 - self.alpha) * self._R_smooth + self.alpha * R
+        # Re-orthogonalise to keep it a valid rotation matrix
+        U, _, Vt = np.linalg.svd(R_blended)
+        self._R_smooth = U @ Vt
+        return self._R_smooth
 
     def reset(self) -> None:
-        self._angles = None
-        self._rotation_matrix = None
-
-    def update(
-        self,
-        yaw: float,
-        pitch: float,
-        roll: float,
-        rotation_matrix: tuple[tuple[float, float, float], ...] | np.ndarray,
-    ) -> tuple[tuple[float, float, float], tuple[tuple[float, float, float], ...]]:
-        rotation = np.array(rotation_matrix, dtype=np.float64)
-        if self._angles is None:
-            self._angles = (yaw, pitch, roll)
-            self._rotation_matrix = rotation
-            return self._angles, tuple(tuple(float(v) for v in row) for row in rotation)
-        self._angles = (
-            self._angles[0] * (1.0 - self.alpha) + yaw * self.alpha,
-            self._angles[1] * (1.0 - self.alpha) + pitch * self.alpha,
-            self._angles[2] * (1.0 - self.alpha) + roll * self.alpha,
-        )
-        self._rotation_matrix = self._rotation_matrix * (1.0 - self.alpha) + rotation * self.alpha
-        u, _, vt = np.linalg.svd(self._rotation_matrix)
-        clean_rotation = u @ vt
-        if np.linalg.det(clean_rotation) < 0:
-            u[:, -1] *= -1.0
-            clean_rotation = u @ vt
-        self._rotation_matrix = clean_rotation
-        return self._angles, tuple(tuple(float(v) for v in row) for row in clean_rotation)
+        self._R_smooth = None
 
 
 def apply_sensitivity(norm_x: float, norm_y: float, sensitivity: float) -> Point:

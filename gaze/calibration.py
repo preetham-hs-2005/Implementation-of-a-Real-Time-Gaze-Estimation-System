@@ -93,6 +93,8 @@ class HomographyCalibrationModel:
         return self.H is not None or (self.fallback is not None and self.fallback.is_fitted)
 
     def fit(self) -> None:
+        self.H = None
+        self.H_inv = None
         if len(self.points) < 8:
             if self.fallback is not None:
                 print("[CALIB] Homography unavailable (<8 points). Falling back to polynomial fit.")
@@ -109,8 +111,8 @@ class HomographyCalibrationModel:
                 return
             raise ValueError("Homography fit failed - not enough inliers.")
         inlier_count = int(mask.sum()) if mask is not None else len(self.points)
-        min_inliers = max(4, len(self.points) // 2)
-        if inlier_count < min_inliers:
+        min_inlier_ratio = 0.5
+        if inlier_count / max(len(self.points), 1) < min_inlier_ratio:
             print(
                 f"[CALIB] Homography inlier ratio too low ({inlier_count}/{len(self.points)} < 50%). "
                 "Falling back to polynomial fit for better accuracy."
@@ -144,181 +146,45 @@ class HomographyCalibrationModel:
 
 
 @dataclass
-class HeadPoseSample:
-    face_center_norm: Point
-    face_size_norm: Point
-    nose_norm: Point
-    left_eye_center_norm: Point
-    right_eye_center_norm: Point
-    interocular_distance_norm: float
-    yaw: float = 0.0
-    pitch: float = 0.0
-    roll: float = 0.0
-    rotation_matrix: tuple[tuple[float, float, float], ...] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+class NeutralPoseCapture:
+    """
+    Captures the head rotation matrix when the user is looking straight ahead.
+    This is the only head reference the system needs.
+    Auto-captures after 25 stable frames. Can also be triggered with j.
+    """
+    required_frames: int = 25
+    _rotation_matrices: list = field(default_factory=list)
+    R_neutral: Optional[np.ndarray] = None
 
-
-@dataclass
-class HeadPoseReference:
-    face_center_norm: Point
-    face_size_norm: Point
-    nose_norm: Point
-    left_eye_center_norm: Point
-    right_eye_center_norm: Point
-    interocular_distance_norm: float
-    yaw: float = 0.0
-    pitch: float = 0.0
-    roll: float = 0.0
-    center_tolerance: Point = (0.08, 0.08)
-    size_tolerance: Point = (0.15, 0.18)
-    eye_distance_tolerance: float = 0.12
-    angle_tolerance: Tuple[float, float, float] = (0.30, 0.24, 0.25)
-    neutral_rotation_matrix: Optional[tuple[tuple[float, float, float], ...]] = None
-
-    def alignment_score(self, sample: HeadPoseSample) -> float:
-        center_dx = abs(sample.face_center_norm[0] - self.face_center_norm[0]) / max(self.center_tolerance[0], 1e-6)
-        center_dy = abs(sample.face_center_norm[1] - self.face_center_norm[1]) / max(self.center_tolerance[1], 1e-6)
-        size_dx = abs(sample.face_size_norm[0] - self.face_size_norm[0]) / max(self.size_tolerance[0], 1e-6)
-        size_dy = abs(sample.face_size_norm[1] - self.face_size_norm[1]) / max(self.size_tolerance[1], 1e-6)
-        eye_dist = abs(sample.interocular_distance_norm - self.interocular_distance_norm) / max(self.eye_distance_tolerance, 1e-6)
-        yaw = abs(sample.yaw - self.yaw) / max(self.angle_tolerance[0], 1e-6)
-        pitch = abs(sample.pitch - self.pitch) / max(self.angle_tolerance[1], 1e-6)
-        roll = abs(sample.roll - self.roll) / max(self.angle_tolerance[2], 1e-6)
-        return float(max(center_dx, center_dy, size_dx, size_dy, eye_dist, yaw, pitch, roll))
-
-    def is_aligned(self, sample: HeadPoseSample) -> bool:
-        return self.alignment_score(sample) <= 1.0
-
-
-@dataclass
-class HeadPoseCalibrator:
-    required_samples: int = 30
-    samples: List[HeadPoseSample] = field(default_factory=list)
+    def add_frame(self, R: np.ndarray, iris_valid: bool, is_fixating: bool) -> bool:
+        """Returns True when capture is complete."""
+        if self.R_neutral is not None:
+            return True
+        if not iris_valid or not is_fixating:
+            return False
+        self._rotation_matrices.append(R.copy())
+        if len(self._rotation_matrices) >= self.required_frames:
+            # Average rotation matrices and re-orthogonalise with SVD
+            mean_R = np.mean(self._rotation_matrices, axis=0)
+            U, _, Vt = np.linalg.svd(mean_R)
+            self.R_neutral = U @ Vt
+            print(f"[HEAD] Neutral rotation captured from {len(self._rotation_matrices)} frames.")
+            return True
+        return False
 
     def reset(self) -> None:
-        self.samples.clear()
-
-    def add_sample(self, sample: HeadPoseSample) -> None:
-        self.samples.append(sample)
-        if len(self.samples) > self.required_samples:
-            self.samples.pop(0)
+        self._rotation_matrices.clear()
+        self.R_neutral = None
 
     @property
     def progress(self) -> float:
-        return min(1.0, len(self.samples) / max(1, self.required_samples))
+        if self.R_neutral is not None:
+            return 1.0
+        return len(self._rotation_matrices) / self.required_frames
 
     @property
     def is_ready(self) -> bool:
-        return len(self.samples) >= self.required_samples
-
-    def build_reference(self) -> HeadPoseReference:
-        if not self.is_ready:
-            raise ValueError("Head pose calibration requires more samples.")
-
-        centers = np.array([sample.face_center_norm for sample in self.samples], dtype=np.float64)
-        sizes = np.array([sample.face_size_norm for sample in self.samples], dtype=np.float64)
-        noses = np.array([sample.nose_norm for sample in self.samples], dtype=np.float64)
-        left_eyes = np.array([sample.left_eye_center_norm for sample in self.samples], dtype=np.float64)
-        right_eyes = np.array([sample.right_eye_center_norm for sample in self.samples], dtype=np.float64)
-        eye_dists = np.array([sample.interocular_distance_norm for sample in self.samples], dtype=np.float64)
-        yaws = np.array([sample.yaw for sample in self.samples], dtype=np.float64)
-        pitches = np.array([sample.pitch for sample in self.samples], dtype=np.float64)
-        rolls = np.array([sample.roll for sample in self.samples], dtype=np.float64)
-        rot_matrices = np.array([sample.rotation_matrix for sample in self.samples], dtype=np.float64)
-        mean_rot = rot_matrices.mean(axis=0)
-        u, _, vt = np.linalg.svd(mean_rot)
-        neutral_r = u @ vt
-        if np.linalg.det(neutral_r) < 0:
-            u[:, -1] *= -1.0
-            neutral_r = u @ vt
-
-        return HeadPoseReference(
-            face_center_norm=(float(np.median(centers[:, 0])), float(np.median(centers[:, 1]))),
-            face_size_norm=(float(np.median(sizes[:, 0])), float(np.median(sizes[:, 1]))),
-            nose_norm=(float(np.median(noses[:, 0])), float(np.median(noses[:, 1]))),
-            left_eye_center_norm=(float(np.median(left_eyes[:, 0])), float(np.median(left_eyes[:, 1]))),
-            right_eye_center_norm=(float(np.median(right_eyes[:, 0])), float(np.median(right_eyes[:, 1]))),
-            interocular_distance_norm=float(np.median(eye_dists)),
-            yaw=float(np.median(yaws)),
-            pitch=float(np.median(pitches)),
-            roll=float(np.median(rolls)),
-            neutral_rotation_matrix=tuple(tuple(float(v) for v in row) for row in neutral_r),
-        )
-
-
-@dataclass
-class HeadPoseExtremes:
-    center: HeadPoseReference
-    left_yaw: float
-    right_yaw: float
-    up_pitch: float
-    down_pitch: float
-
-    def normalize_angles(self, yaw: float, pitch: float, roll: float) -> tuple[float, float, float]:
-        yaw_left_span = max(1e-4, self.center.yaw - self.left_yaw)
-        yaw_right_span = max(1e-4, self.right_yaw - self.center.yaw)
-        pitch_up_span = max(1e-4, self.center.pitch - self.up_pitch)
-        pitch_down_span = max(1e-4, self.down_pitch - self.center.pitch)
-
-        yaw_norm = (yaw - self.center.yaw) / (yaw_right_span if yaw >= self.center.yaw else yaw_left_span)
-        pitch_norm = (pitch - self.center.pitch) / (pitch_down_span if pitch >= self.center.pitch else pitch_up_span)
-        roll_norm = (roll - self.center.roll) / max(self.center.angle_tolerance[2], 1e-4)
-        return float(np.clip(yaw_norm, -1.5, 1.5)), float(np.clip(pitch_norm, -1.5, 1.5)), float(np.clip(roll_norm, -1.5, 1.5))
-
-    def exceeds_threshold(self, yaw: float, pitch: float, roll: float, threshold: float = 1.15) -> bool:
-        yaw_norm, pitch_norm, roll_norm = self.normalize_angles(yaw, pitch, roll)
-        return max(abs(yaw_norm), abs(pitch_norm), abs(roll_norm)) > threshold
-
-
-HEAD_POSE_SEQUENCE: tuple[str, ...] = ("straight", "left", "right", "up", "down")
-
-
-@dataclass
-class HeadPoseSequenceCalibrator:
-    required_samples: int = 18
-    current_index: int = 0
-    samples_by_label: dict[str, list[HeadPoseSample]] = field(default_factory=lambda: {label: [] for label in HEAD_POSE_SEQUENCE})
-
-    def reset(self) -> None:
-        self.current_index = 0
-        self.samples_by_label = {label: [] for label in HEAD_POSE_SEQUENCE}
-
-    @property
-    def current_label(self) -> str:
-        return HEAD_POSE_SEQUENCE[min(self.current_index, len(HEAD_POSE_SEQUENCE) - 1)]
-
-    @property
-    def is_complete(self) -> bool:
-        return self.current_index >= len(HEAD_POSE_SEQUENCE)
-
-    def add_sample(self, sample: HeadPoseSample) -> None:
-        if self.is_complete:
-            return
-        label = self.current_label
-        bucket = self.samples_by_label[label]
-        bucket.append(sample)
-        if len(bucket) >= self.required_samples:
-            self.current_index += 1
-
-    def progress_text(self) -> str:
-        if self.is_complete:
-            return "done"
-        return f"{self.current_label} {len(self.samples_by_label[self.current_label])}/{self.required_samples}"
-
-    def build_extremes(self) -> HeadPoseExtremes:
-        if not self.is_complete:
-            raise ValueError("Head pose sequence calibration is incomplete.")
-        refs = {}
-        for label in HEAD_POSE_SEQUENCE:
-            calibrator = HeadPoseCalibrator(required_samples=len(self.samples_by_label[label]))
-            calibrator.samples = list(self.samples_by_label[label])
-            refs[label] = calibrator.build_reference()
-        return HeadPoseExtremes(
-            center=refs["straight"],
-            left_yaw=refs["left"].yaw,
-            right_yaw=refs["right"].yaw,
-            up_pitch=refs["up"].pitch,
-            down_pitch=refs["down"].pitch,
-        )
+        return self.R_neutral is not None
 
 
 def default_calibration_targets(grid_size: int = 9) -> Sequence[Point]:
@@ -353,21 +219,6 @@ def apply_head_pose_compensation(gaze_norm: Point, transform_matrix: Optional[It
     return max(0.0, min(1.0, compensated_x)), max(0.0, min(1.0, compensated_y))
 
 
-def make_head_pose_sample(obs) -> HeadPoseSample:
-    return HeadPoseSample(
-        face_center_norm=obs.face_center_norm,
-        face_size_norm=obs.face_size_norm,
-        nose_norm=obs.nose_norm,
-        left_eye_center_norm=obs.left_eye_center_norm,
-        right_eye_center_norm=obs.right_eye_center_norm,
-        interocular_distance_norm=obs.interocular_distance_norm,
-        yaw=obs.yaw,
-        pitch=obs.pitch,
-        roll=obs.roll,
-        rotation_matrix=obs.head_rotation_matrix,
-    )
-
-
 def project_gaze_to_screen(gaze_dir_world: Sequence[float], screen_z: float = 1.0) -> Point:
     del screen_z
     angle_x, angle_y = gaze_to_screen_angles(gaze_dir_world)
@@ -382,30 +233,6 @@ def gaze_to_screen_angles(gaze_world: Sequence[float]) -> Point:
     angle_x = math.atan2(gx, gz)
     angle_y = math.atan2(gy, gz)
     return angle_x, angle_y
-
-
-def build_gaze_feature_vector(
-    obs,
-    head_sample: HeadPoseSample,
-    head_reference: Optional[HeadPoseReference],
-    head_extremes: Optional[HeadPoseExtremes],
-) -> FeatureVector:
-    del head_sample, head_reference, head_extremes
-    screen_x_raw, screen_y_raw = project_gaze_to_screen(obs.gaze_vector)
-    return (
-        screen_x_raw,
-        screen_y_raw,
-        obs.gaze_vector[0],
-        obs.gaze_vector[1],
-        obs.gaze_vector[2],
-        obs.left_iris_relative[0],
-        obs.left_iris_relative[1],
-        obs.right_iris_relative[0],
-        obs.right_iris_relative[1],
-        obs.yaw,
-        obs.pitch,
-        obs.roll,
-    )
 
 
 @dataclass
@@ -429,14 +256,7 @@ class GazeDriftCorrector:
         return norm[0] + self.correction[0], norm[1] + self.correction[1]
 
 
-def fallback_head_pose_extremes(reference: HeadPoseReference) -> HeadPoseExtremes:
-    return HeadPoseExtremes(
-        center=reference,
-        left_yaw=reference.yaw - reference.angle_tolerance[0],
-        right_yaw=reference.yaw + reference.angle_tolerance[0],
-        up_pitch=reference.pitch - reference.angle_tolerance[1],
-        down_pitch=reference.pitch + reference.angle_tolerance[1],
-    )
+
 
 
 @dataclass

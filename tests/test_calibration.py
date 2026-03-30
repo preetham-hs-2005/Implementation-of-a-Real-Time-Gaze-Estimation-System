@@ -1,8 +1,12 @@
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 from gaze.calibration import (
     HEAD_POSE_SEQUENCE,
     CalibrationModel,
+    HomographyCalibrationModel,
     HeadPoseCalibrator,
     HeadPoseSequenceCalibrator,
     HeadPoseSample,
@@ -97,6 +101,21 @@ class CalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(features[0], 0.23270136940396716, places=5)
         self.assertAlmostEqual(features[2], 0.12)
         self.assertAlmostEqual(features[5], 0.08)
+
+    def test_homography_falls_back_when_inlier_ratio_is_below_half(self):
+        model = HomographyCalibrationModel()
+        for index in range(8):
+            model.add_sample(index * 0.1, index * 0.05, index * 0.1, index * 0.05)
+
+        with patch("gaze.calibration._cv2.findHomography") as mock_find_homography:
+            mock_find_homography.return_value = (
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                np.array([[1], [1], [1], [0], [0], [0], [0], [0]], dtype=np.uint8),
+            )
+            model.fit()
+
+        self.assertIsNone(model.H)
+        self.assertTrue(model.fallback.is_fitted)
 
 
 if __name__ == "__main__":

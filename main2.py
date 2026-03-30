@@ -289,17 +289,6 @@ def _probe_capture_stream(cv2, cap, num_frames: int = 3) -> tuple[bool, float]:
     return any_frame, max_mean
 
 
-def _read_frame_with_retry(cap, retries: int = 8, delay_s: float = 0.05):
-    frame = None
-    for attempt in range(retries):
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            return True, frame
-        if attempt < retries - 1:
-            time.sleep(delay_s)
-    return False, frame
-
-
 def _try_open_camera(cv2, camera_index: int, backend_name: str, accept_dark_stream: bool = False):
     attempts: list[str] = []
     best_dark = None
@@ -327,7 +316,7 @@ def _try_open_camera(cv2, camera_index: int, backend_name: str, accept_dark_stre
         else:
             cap.release()
 
-    if accept_dark_stream and best_dark is not None:
+    if best_dark is not None:
         brightness, backend_label, cap = best_dark
         print(
             f"[WARN] Using dark camera stream from index {camera_index} with backend '{backend_label}' "
@@ -362,15 +351,6 @@ def open_camera(cv2, camera_index: int, backend_name: str):
             attempts.extend([f"index {fallback_index} {item}" for item in fallback_attempts])
             if cap is not None:
                 print(f"[INFO] Falling back to camera index {fallback_index}.")
-                return cap
-        print("[WARN] No bright fallback camera stream found. Retrying nearby indices and allowing dim streams...")
-        for fallback_index in range(6):
-            if fallback_index == camera_index:
-                continue
-            cap, fallback_attempts = _try_open_camera(cv2, fallback_index, "auto", accept_dark_stream=True)
-            attempts.extend([f"index {fallback_index} dim {item}" for item in fallback_attempts])
-            if cap is not None:
-                print(f"[INFO] Falling back to dim camera stream on index {fallback_index}.")
                 return cap
 
     attempted = "; ".join(attempts) if attempts else "no backends attempted"
@@ -499,9 +479,9 @@ def main() -> None:
             cv2.setMouseCallback(window_name, on_mouse)
             frame_count = 0
             while True:
-                ret, frame = _read_frame_with_retry(cap)
+                ret, frame = cap.read()
                 if not ret:
-                    print("[ERROR] Failed to read frame from camera after retries")
+                    print("[ERROR] Failed to read frame from camera")
                     break
                 frame_count += 1
                 if frame_count % 30 == 0:  # Print every 30 frames
@@ -520,7 +500,7 @@ def main() -> None:
 
                 status = 0
                 obs = None
-                smoothed_angles: Optional[tuple[float, float]] = None
+                                smoothed_angles: Optional[tuple[float, float]] = None
                 mapped_norm: Optional[tuple[float, float]] = None
                 gaze_state = "fixation"
                 
@@ -560,18 +540,91 @@ def main() -> None:
                         prev_gaze_angles = smoothed_angles
 
 
-                    if neutral_capture.is_ready:
-                        draw_status(cv2, frame, "Head reference ready", status)
+                    if head_reference is None:
+                        draw_status(cv2, frame, "Head reference: hold still for auto-capture or press j", status)
                         status += 1
-                        draw_status(
-                            cv2,
-                            frame,
-                            f"Pose yaw/pitch/roll: {obs.yaw:+.2f} {obs.pitch:+.2f} {obs.roll:+.2f}",
-                            status,
-                        )
-                        status += 1
+                        if obs.iris_visibility >= 0.5:
+                            head_calibrator.add_sample(head_sample)
+                            draw_status(
+                                cv2,
+                                frame,
+                                f"Capturing head reference... {int(head_calibrator.progress * 100)}%",
+                                status,
+                            )
+                            status += 1
+                            if head_calibrator.is_ready:
+                                head_reference = head_calibrator.build_reference()
+                                head_reference.center_tolerance = (
+                                    args.head_center_tolerance,
+                                    args.head_center_tolerance,
+                                )
+                                head_reference.size_tolerance = (
+                                    args.head_size_tolerance,
+                                    args.head_size_tolerance * 1.2,
+                                )
+                                head_guidance_reference = head_reference
+                                active_head_reference = head_reference
+                                head_extremes = fallback_head_pose_extremes(head_reference) if args.disable_head_pose_calibration else head_extremes
+                                if args.disable_head_pose_calibration:
+                                    osk_message = "Head calibration complete. Press c to calibrate gaze."
+                                else:
+                                    osk_message = "Straight pose captured. Follow pose prompts to improve tilt/turn robustness."
+                        else:
+                            draw_status(cv2, frame, "Keep both eyes visible for auto head capture", status)
+                            status += 1
+                    else:
+                        if head_extremes is None and not args.disable_head_pose_calibration:
+                            draw_status(
+                                cv2,
+                                frame,
+                                f"Head pose calibration: {head_pose_instruction(head_pose_sequence.current_label)}",
+                                status,
+                            )
+                            status += 1
+                            if obs.iris_visibility >= 0.5:
+                                head_pose_sequence.add_sample(head_sample)
+                                draw_status(
+                                    cv2,
+                                    frame,
+                                    f"Pose samples: {head_pose_sequence.progress_text()}",
+                                    status,
+                                )
+                                status += 1
+                                if head_pose_sequence.is_complete:
+                                    head_extremes = head_pose_sequence.build_extremes()
+                                    head_reference = head_extremes.center
+                                    head_reference.center_tolerance = (
+                                        args.head_center_tolerance,
+                                        args.head_center_tolerance,
+                                    )
+                                    head_reference.size_tolerance = (
+                                        args.head_size_tolerance,
+                                        args.head_size_tolerance * 1.2,
+                                    )
+                                    head_guidance_reference = head_reference
+                                    osk_message = "Head pose calibration complete. Press c to calibrate gaze."
+                            else:
+                                draw_status(cv2, frame, "Hold pose and keep eyes visible", status)
+                                status += 1
+                        else:
+                            draw_status(cv2, frame, "Head reference ready", status)
+                            status += 1
+
+                        if head_extremes is not None:
+                            draw_status(
+                                cv2,
+                                frame,
+                                f"Pose yaw/pitch/roll: {obs.yaw:+.2f} {obs.pitch:+.2f} {obs.roll:+.2f}",
+                                status,
+                            )
+                            status += 1
+                            if head_extremes.exceeds_threshold(obs.yaw, obs.pitch, obs.roll, args.recalibration_angle_threshold):
+                                draw_status(cv2, frame, "Large head rotation detected - consider recalibration", status)
+                                status += 1
 
                     if calibrating:
+                        import numpy as np
+
                         calib_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
                         tx, ty = calibration_targets[calibration_index]
                         target_x, target_y = int(tx * screen_w), int(ty * screen_h)
@@ -785,9 +838,23 @@ def main() -> None:
                 if key == ord("h"):
                     neutral_capture.reset()
                     osk_message = "Head reference reset."
-                if key == ord("j"):
-                    neutral_capture.reset()
-                    osk_message = "Hold still to recapture head reference."
+                if key == ord("j") and head_sample is not None and head_reference is None:
+                    head_calibrator.add_sample(head_sample)
+                    if head_calibrator.is_ready:
+                        head_reference = head_calibrator.build_reference()
+                        head_reference.center_tolerance = (
+                            args.head_center_tolerance,
+                            args.head_center_tolerance,
+                        )
+                        head_reference.size_tolerance = (
+                            args.head_size_tolerance,
+                            args.head_size_tolerance * 1.2,
+                        )
+                        head_guidance_reference = head_reference
+                        head_extremes = fallback_head_pose_extremes(head_reference)
+                        osk_message = "Straight head captured. Press c to start gaze calibration."
+                    else:
+                        osk_message = f"Capturing straight head... {int(head_calibrator.progress * 100)}%"
                 if key == ord("m"):
                     click_mode = "right" if click_mode == "left" else "left"
                 if key == ord("v"):
@@ -803,8 +870,7 @@ def main() -> None:
                 if key == ord("c"):
                     if not neutral_capture.is_ready:
                         osk_message = "Waiting for auto head reference capture. Hold still or press j."
-                    else:
-                        calibration_targets = sequencer.first_pass_sequence() if is_first_calibration else sequencer.refinement_sequence()
+                    else:                        calibration_targets = sequencer.first_pass_sequence() if is_first_calibration else sequencer.refinement_sequence()
                         calibration.clear()
                         calibrating = True
                         calibration_index = 0
@@ -843,7 +909,7 @@ def main() -> None:
                         calibration_anchor_feature = None
                         calibration_stability_buffer.clear()
                     
-                    if collecting and obs is not None:
+                    if collecting and obs is not None 
                         if smoothed_angles is None:
                             calibration_status_message = "Head reference not ready for calibration"
                             continue

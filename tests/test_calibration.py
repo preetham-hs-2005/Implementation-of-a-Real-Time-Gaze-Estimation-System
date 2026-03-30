@@ -9,7 +9,7 @@ from gaze.calibration import (
     apply_head_pose_compensation,
     build_gaze_feature_vector,
     default_calibration_targets,
-    normalize_gaze_by_head_pose,
+    project_gaze_to_screen,
 )
 
 
@@ -36,9 +36,11 @@ class CalibrationTests(unittest.TestCase):
 
     def test_extended_calibration_grid_has_dense_targets(self):
         targets = default_calibration_targets(16)
-        self.assertEqual(len(targets), 16)
-        self.assertIn((0.08, 0.08), targets)
-        self.assertIn((0.92, 0.92), targets)
+        self.assertEqual(len(targets), 20)
+        self.assertIn((0.05, 0.05), targets)
+        self.assertIn((0.95, 0.95), targets)
+        self.assertIn((0.02, 0.02), targets)
+        self.assertIn((0.98, 0.98), targets)
 
     def test_head_reference_calibration_and_alignment(self):
         calibrator = HeadPoseCalibrator(required_samples=3)
@@ -51,16 +53,12 @@ class CalibrationTests(unittest.TestCase):
             calibrator.add_sample(sample)
         reference = calibrator.build_reference()
         self.assertTrue(reference.is_aligned(samples[0]))
+        self.assertIsNotNone(reference.neutral_rotation_matrix)
 
-    def test_head_normalization_offsets_small_head_shift(self):
-        reference_calibrator = HeadPoseCalibrator(required_samples=1)
-        sample = HeadPoseSample((0.50, 0.50), (0.34, 0.48), (0.50, 0.54), (0.43, 0.43), (0.57, 0.43), 0.14, 0.0, 0.0, 0.0)
-        reference_calibrator.add_sample(sample)
-        reference = reference_calibrator.build_reference()
-
-        shifted = HeadPoseSample((0.55, 0.50), (0.34, 0.48), (0.55, 0.54), (0.48, 0.43), (0.62, 0.43), 0.14, 0.12, 0.0, 0.0)
-        normalized = normalize_gaze_by_head_pose((0.60, 0.50), shifted, reference)
-        self.assertLess(normalized[0], 0.60)
+    def test_project_gaze_to_screen(self):
+        screen_x, screen_y = project_gaze_to_screen((0.25, -0.10, 1.0))
+        self.assertAlmostEqual(screen_x, 0.46787368817200947, places=5)
+        self.assertAlmostEqual(screen_y, -0.19035265945600086, places=5)
 
     def test_head_pose_sequence_builds_extremes(self):
         sequence = HeadPoseSequenceCalibrator(required_samples=1)
@@ -85,6 +83,7 @@ class CalibrationTests(unittest.TestCase):
             eye_gaze_norm = (0.1, -0.1)
             left_iris_relative = (0.08, -0.02)
             right_iris_relative = (0.09, -0.01)
+            gaze_vector = (0.12, -0.08, 0.98)
             yaw = 0.05
             pitch = -0.03
             roll = 0.01
@@ -94,8 +93,10 @@ class CalibrationTests(unittest.TestCase):
         reference_calibrator.add_sample(sample)
         reference = reference_calibrator.build_reference()
         features = build_gaze_feature_vector(Obs(), sample, reference, None)
-        self.assertEqual(len(features), 11)
-        self.assertAlmostEqual(features[2], 0.1)
+        self.assertEqual(len(features), 12)
+        self.assertAlmostEqual(features[0], 0.23270136940396716, places=5)
+        self.assertAlmostEqual(features[2], 0.12)
+        self.assertAlmostEqual(features[5], 0.08)
 
 
 if __name__ == "__main__":

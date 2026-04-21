@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """Real-time gaze-controlled cursor with calibration and advanced interactions."""
 from __future__ import annotations
 
@@ -260,6 +260,41 @@ def point_in_rect(point: tuple[int, int], rect: tuple[int, int, int, int]) -> bo
     x, y = point
     x1, y1, x2, y2 = rect
     return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def draw_gaze_debug_overlay(cv2, frame, angle_x: float, angle_y: float, gaze_state: str) -> None:
+    """Draw gaze debug information on the frame during calibration."""
+    height, width = frame.shape[:2]
+    cv2.putText(
+        frame,
+        f"Gaze X: {angle_x:+.3f} rad",
+        (10, height - 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Gaze Y: {angle_y:+.3f} rad",
+        (10, height - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"State: {gaze_state}",
+        (width - 250, height - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def _backend_candidates(cv2, backend_name: str) -> list[tuple[str, Optional[int]]]:

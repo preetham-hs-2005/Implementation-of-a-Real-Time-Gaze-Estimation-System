@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-size-tolerance", type=float, default=0.16, help="Allowed normalized face-size drift from calibrated pose.")
     parser.add_argument("--recalibration-angle-threshold", type=float, default=1.2, help="Normalized yaw/pitch/roll threshold before suggesting recalibration.")
     parser.add_argument("--calib-frames", type=int, default=30, help="Accepted stable frames required per gaze calibration point.")
+    parser.add_argument("--quick-calibration", action="store_true", help="Use fewer points and auto-capture to speed up calibration for demos.")
     parser.add_argument("--no-personal-model", action="store_true", help="Disable persistent personal gaze model.")
     parser.add_argument("--clear-personal-model", action="store_true", help="Delete saved personal gaze profile and exit.")
 
@@ -262,6 +263,41 @@ def point_in_rect(point: tuple[int, int], rect: tuple[int, int, int, int]) -> bo
     return x1 <= x <= x2 and y1 <= y <= y2
 
 
+def draw_gaze_debug_overlay(cv2, frame, angle_x: float, angle_y: float, gaze_state: str) -> None:
+    """Draw gaze debug information on the frame during calibration."""
+    height, width = frame.shape[:2]
+    cv2.putText(
+        frame,
+        f"Gaze X: {angle_x:+.3f} rad",
+        (10, height - 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Gaze Y: {angle_y:+.3f} rad",
+        (10, height - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"State: {gaze_state}",
+        (width - 250, height - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def _backend_candidates(cv2, backend_name: str) -> list[tuple[str, Optional[int]]]:
     if not platform.system().lower().startswith("win"):
         return [("default", None)]
@@ -426,15 +462,20 @@ def main() -> None:
 
     calibration = HomographyCalibrationModel()
     quality_map = CalibrationQualityMap()
-    sequencer = AdaptiveCalibrationSequencer(base_targets=list(default_calibration_targets(args.calibration_points)))
+    effective_calibration_points = 5 if args.quick_calibration else args.calibration_points
+    effective_calib_frames = min(args.calib_frames, 10) if args.quick_calibration else args.calib_frames
+    effective_head_frames = min(args.head_calibration_frames, 12) if args.quick_calibration else args.head_calibration_frames
+    auto_collect_delay_s = 0.45 if args.quick_calibration else None
+    calibration_preview_ms = 1200 if args.quick_calibration else 3000
+    sequencer = AdaptiveCalibrationSequencer(base_targets=list(default_calibration_targets(effective_calibration_points)))
     calibration_targets = sequencer.first_pass_sequence()
     is_first_calibration = True
     calibrating = False
     calibration_index = 0
     collecting = False
     samples_collected = 0
-    FRAMES_TO_COLLECT = args.calib_frames
-    neutral_capture = NeutralPoseCapture(required_frames=args.head_calibration_frames)
+    FRAMES_TO_COLLECT = effective_calib_frames
+    neutral_capture = NeutralPoseCapture(required_frames=effective_head_frames)
     drift = GazeDriftCorrector()
 
     cursor = CursorSmoother(
@@ -450,6 +491,7 @@ def main() -> None:
     calibration_status_message = ""
     calibration_anchor_feature: Optional[tuple[float, float]] = None
     calibration_stability_buffer: deque[float] = deque(maxlen=6)
+    calibration_ready_since: Optional[float] = None
     fixation = FixationDetector(saccade_threshold_rad_s=args.saccade_threshold, stabilisation_frames=3)
     blink = AdaptiveBlinkDetector(
         baseline_alpha=args.baseline_alpha,
@@ -464,6 +506,19 @@ def main() -> None:
     dwell_enabled = False
     gaze_control_enabled = True
     osk_message = ""
+    if not args.no_personal_model:
+        all_pts = store.get_weighted_points()
+        if len(all_pts) >= 20:
+            personal_model = HomographyCalibrationModel()
+            for ax, ay, sx, sy in all_pts:
+                personal_model.add_sample(ax, ay, sx, sy)
+            try:
+                personal_model.fit()
+                calibration = personal_model
+                is_first_calibration = False
+                osk_message = f"Loaded personal gaze profile ({len(all_pts)} samples). Press r for a quick refinement."
+            except Exception:
+                pass
 
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -590,8 +645,12 @@ def main() -> None:
                             quality_score=quality_map.score(calibration_targets[calibration_index]),
                             is_refinement=not is_first_calibration,
                         )
-                        status_color = (0, 220, 80) if (obs.iris_valid and fixation.is_fixating) else (0, 80, 255)
-                        msg = "Ready - press SPACE" if (obs.iris_valid and fixation.is_fixating) else "Hold still, eyes open"
+                        ready_for_capture = obs is not None and obs.iris_valid and fixation.is_fixating
+                        status_color = (0, 220, 80) if ready_for_capture else (0, 80, 255)
+                        if args.quick_calibration:
+                            msg = "Hold gaze steady to auto-capture" if ready_for_capture else "Hold still, eyes open"
+                        else:
+                            msg = "Ready - press SPACE" if ready_for_capture else "Hold still, eyes open"
                         cv2.putText(
                             calib_frame,
                             msg,
@@ -821,6 +880,7 @@ def main() -> None:
                         calibration_status_message = ""
                         calibration_anchor_feature = None
                         calibration_stability_buffer.clear()
+                        calibration_ready_since = None
                         cv2.namedWindow("Full Screen Calibration", cv2.WINDOW_NORMAL)
                         cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
                         cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_TOPMOST, 1)
@@ -837,18 +897,32 @@ def main() -> None:
                     calibration_status_message = ""
                     calibration_anchor_feature = None
                     calibration_stability_buffer.clear()
+                    calibration_ready_since = None
                     osk_message = f"Refinement calibration: {len(calibration_targets)} points targeting weak areas"
                     cv2.namedWindow("Full Screen Calibration", cv2.WINDOW_NORMAL)
                     cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
                     cv2.setWindowProperty("Full Screen Calibration", cv2.WND_PROP_TOPMOST, 1)
 
                 if calibrating:
+                    if args.quick_calibration and not collecting and obs is not None and fixation.is_fixating and obs.iris_valid and obs.iris_weight >= 0.3:
+                        if calibration_ready_since is None:
+                            calibration_ready_since = time.time()
+                        elif auto_collect_delay_s is not None and (time.time() - calibration_ready_since) >= auto_collect_delay_s:
+                            collecting = True
+                            samples_collected = 0
+                            calibration_status_message = "Auto-capturing samples..."
+                            calibration_anchor_feature = None
+                            calibration_stability_buffer.clear()
+                    else:
+                        calibration_ready_since = None
+
                     if key == ord(" "):
                         collecting = True
                         samples_collected = 0
                         calibration_status_message = "Capturing samples..."
                         calibration_anchor_feature = None
                         calibration_stability_buffer.clear()
+                        calibration_ready_since = None
                     
                     if collecting and obs is not None:
                         if smoothed_angles is None:
@@ -860,9 +934,11 @@ def main() -> None:
                         gaze_state = fixation.update(smoothed_angles[0], smoothed_angles[1], time.time())
                         if gaze_state != "fixation":
                             calibration_status_message = f"Wait for fixation... ({gaze_state})"
+                            calibration_ready_since = None
                             continue
                         if not obs.iris_valid or obs.iris_weight < 0.3:
                             calibration_status_message = "Open eyes wider - iris not reliable"
+                            calibration_ready_since = None
                             continue
 
                         calibration_stability_buffer.append(smoothed_angles[0])
@@ -887,6 +963,7 @@ def main() -> None:
                             calibration_status_message = ""
                             calibration_anchor_feature = None
                             calibration_stability_buffer.clear()
+                            calibration_ready_since = None
                             calibration_index += 1
                             if calibration_index >= len(calibration_targets):
                                 calibration.fit()
@@ -897,25 +974,28 @@ def main() -> None:
                                     session_pts = [(ax, ay, sx, sy) for ax, ay, sx, sy in calibration.points]
                                     store.add_session_samples(session_pts)
                                     store.save()
-                                    all_pts = store.get_weighted_points()
-                                    if len(all_pts) >= 20:
+                                    weighted_pts = store.get_weighted_points()
+                                    if len(weighted_pts) >= 20:
                                         enriched = HomographyCalibrationModel()
-                                        for ax, ay, sx, sy in all_pts:
+                                        for ax, ay, sx, sy in weighted_pts:
                                             enriched.add_sample(ax, ay, sx, sy)
                                         try:
                                             enriched.fit()
                                             calibration = enriched
-                                            osk_message = f"Personal model fitted on {len(all_pts)} lifetime samples"
+                                            osk_message = f"Personal model fitted on {len(weighted_pts)} lifetime samples"
                                         except Exception:
                                             pass
                                 heatmap = draw_quality_heatmap(cv2, screen_w, screen_h, quality_map)
                                 cv2.imshow("Full Screen Calibration", heatmap)
-                                cv2.waitKey(3000)
+                                cv2.waitKey(calibration_preview_ms)
                                 calibrating = False
                                 cv2.destroyWindow("Full Screen Calibration")
                                 sequencer.quality_map = quality_map
                                 is_first_calibration = False
-                                osk_message = "Gaze calibration fitted successfully"
+                                if args.quick_calibration:
+                                    osk_message = "Quick gaze calibration fitted successfully"
+                                else:
+                                    osk_message = "Gaze calibration fitted successfully"
     finally:
         if drag.enabled and not args.dry_run:
             try:

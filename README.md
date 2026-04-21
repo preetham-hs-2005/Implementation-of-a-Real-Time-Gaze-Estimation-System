@@ -36,19 +36,25 @@ Safe first run (no real mouse movement):
 python main.py --dry-run --flip --show-debug
 ```
 
+Fast presentation run:
+```bash
+python main.py --flip --show-debug --quick-calibration
+```
+
 ## Runtime controls
 - `q`: quit
 - `c`: start calibration
-- `SPACE`: capture the current calibration dot (records 15 frames, then advances)
+- `SPACE`: manually capture the current calibration dot
 - `m`: toggle click mode (left/right)
 - `v`: toggle dwell click
 - `g`: toggle drag hold
 - `k`: launch on-screen keyboard (if available)
-m
+
 ## Useful flags
 - `--calibration-points {5,9}`
 - `--margin 0.02`
 - `--calibration-frames 15`
+- `--quick-calibration`
 - `--prediction-window 4`
 - `--disable-interaction-learning`
 - `--pose-comp-gain 0.08`
@@ -66,6 +72,10 @@ m
 - `--dwell-radius 45`
 - `--model-path models/face_landmarker.task`
 - `--model-url <url>`
+
+## Presentation tips
+- `--quick-calibration` switches to a faster demo flow: 5 points, fewer stable frames, and auto-capture when you hold your gaze on a dot.
+- The app now reloads your saved personal gaze profile automatically on startup when enough past samples exist, so after one good calibration you can usually start with that profile and only do a quick `r` refinement if needed.
 
 ## Tests
 ```bash
